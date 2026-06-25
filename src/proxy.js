@@ -749,27 +749,114 @@ export function createApp(config) {
                             res.write(sseChunk(id, modelStr, { content: filtered }));
                         };
 
-                        // Send prompt first, then poll for complete response.
-                        // SSE events are unreliable with mimo serve — polling is faster and simpler.
+                        // SSE-first approach: subscribe to event stream BEFORE sending prompt
+                        // to avoid missing early events. Fall back to polling if SSE fails.
                         let collected = null;
                         try {
+                            // 1. Subscribe to SSE event stream first
+                            const sseController = new AbortController();
+                            const eventStreamResult = await client.event.subscribe({ signal: sseController.signal });
+                            const eventStream = eventStreamResult.stream;
+                            let sseFinished = false;
+                            let sseContent = '';
+                            let sseReasoning = '';
+                            let sseReceivedDelta = false;
+
+                            // 2. Start SSE consumer in background
+                            const ssePromise = (async () => {
+                                try {
+                                    // Map partID -> part type (reasoning/text) from part.updated events
+                                    const partTypeMap = new Map();
+                                    for await (const event of eventStream) {
+                                        if (event.type === 'message.part.updated' && event.properties?.part?.sessionID === sessionId) {
+                                            const { part, delta } = event.properties;
+                                            // Track part type by partID
+                                            if (part?.id && part?.type) {
+                                                partTypeMap.set(part.id, part.type);
+                                            }
+                                            // Some part.updated events also carry delta
+                                            if (delta) {
+                                                sseReceivedDelta = true;
+                                                const partType = part?.type || 'text';
+                                                if (partType === 'reasoning') {
+                                                    sseReasoning += delta;
+                                                    sendDelta(delta, true);
+                                                } else {
+                                                    sseContent += delta;
+                                                    sendDelta(delta, false);
+                                                }
+                                            }
+                                        }
+                                        // message.part.delta carries the actual incremental text
+                                        if (event.type === 'message.part.delta') {
+                                            const props = event.properties;
+                                            if (props?.sessionID === sessionId && props?.delta) {
+                                                sseReceivedDelta = true;
+                                                // Determine if this delta is for reasoning or text part
+                                                const partType = partTypeMap.get(props.partID) || 'text';
+                                                if (partType === 'reasoning') {
+                                                    sseReasoning += props.delta;
+                                                    sendDelta(props.delta, true);
+                                                } else {
+                                                    sseContent += props.delta;
+                                                    sendDelta(props.delta, false);
+                                                }
+                                            }
+                                        }
+                                        if (event.type === 'message.updated' &&
+                                            event.properties?.info?.sessionID === sessionId &&
+                                            event.properties.info.finish === 'stop') {
+                                            sseFinished = true;
+                                            break;
+                                        }
+                                    }
+                                } catch (e) {
+                                    logDebug(config, 'SSE consumer error:', e.message);
+                                }
+                            })();
+
+                            // 3. Send prompt after SSE is connected
+                            // Wait a tick to let SSE connection establish
+                            await new Promise(r => setTimeout(r, 100));
                             client.session.prompt(promptParams).catch(err => logDebug(config, 'Prompt error:', err.message));
-                            // Poll with streaming-like behavior: check for partial results
-                            const { content, reasoning, error } = await pollForAssistantResponse(client, config, sessionId, config.REQUEST_TIMEOUT_MS);
-                            collected = { content, reasoning, error };
+
+                            // 4. Wait for SSE to complete or timeout
+                            const sseTimeout = new Promise(resolve => setTimeout(() => resolve('timeout'), config.REQUEST_TIMEOUT_MS));
+                            const sseResult = await Promise.race([ssePromise.then(() => 'done'), sseTimeout]);
+
+                            if (sseFinished || (sseReceivedDelta && sseResult === 'done')) {
+                                collected = { content: sseContent, reasoning: sseReasoning };
+                                logDebug(config, 'SSE completed', { sessionId, deltaChars: sseContent.length + sseReasoning.length });
+                            } else {
+                                // SSE didn't get data or timed out — abort and poll
+                                sseController.abort();
+                                logDebug(config, 'SSE fallback to polling', { sessionId, sseReceivedDelta, sseResult });
+                                const { content, reasoning, error } = await pollForAssistantResponse(client, config, sessionId, config.REQUEST_TIMEOUT_MS);
+                                collected = { content, reasoning, error };
+                                // Send any content not already streamed via SSE
+                                if (reasoning && reasoning.startsWith(sseReasoning)) {
+                                    const rem = reasoning.slice(sseReasoning.length);
+                                    if (rem) sendDelta(rem, true);
+                                } else if (reasoning && !sseReasoning) {
+                                    sendDelta(reasoning, true);
+                                }
+                                if (content && content.startsWith(sseContent)) {
+                                    const rem = content.slice(sseContent.length);
+                                    if (rem) sendDelta(rem, false);
+                                } else if (content && !sseContent) {
+                                    sendDelta(content, false);
+                                }
+                            }
                         } catch (e) {
                             logDebug(config, 'Stream error:', e.message);
                             collected = { __error: e };
                         }
 
-                        // Send collected content as deltas
+                        // Handle errors
                         if (collected?.__error) {
                             sendDelta(`[Proxy Error] ${collected.__error.message || 'Unknown error'}`);
                         } else if (collected?.error && !collected.content && !collected.reasoning) {
                             sendDelta(`[Proxy Error] ${collected.error.name || 'MiMoError'}: ${collected.error.data?.message || collected.error.message || 'Unknown error'}`);
-                        } else {
-                            if (collected?.reasoning) sendDelta(collected.reasoning, true);
-                            if (collected?.content) sendDelta(collected.content, false);
                         }
 
                         if (insideReasoning) {
