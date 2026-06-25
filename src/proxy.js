@@ -955,7 +955,14 @@ export function createApp(config) {
                     }
                 } finally {
                     if (keepaliveInterval) clearInterval(keepaliveInterval);
-                    if (sessionId) { try { await client.session.delete({ path: { id: sessionId } }); } catch {} }
+                    if (sessionId) {
+                        try {
+                            await client.session.delete({ path: { id: sessionId } });
+                            logDebug(config, 'Session deleted', { sessionId });
+                        } catch (e) {
+                            logDebug(config, 'Failed to delete session:', e.message);
+                        }
+                    }
                 }
             }, config.REQUEST_TIMEOUT_MS + 20000);
         } catch (error) {
