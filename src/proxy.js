@@ -7,6 +7,17 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
+import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
+import { buildToolExposure, normalizeExternalToolChoice } from './tool-runtime/router.js';
+import { evaluateToolPolicy } from './tool-runtime/policy.js';
+import { validateToolCalls } from './tool-runtime/validator.js';
+import {
+    stripFunctionCallMarkup,
+    parseExternalToolCallsFromText,
+    createToolCallFilter,
+    createExternalToolCallStreamParser,
+    parseToolCallsFromText
+} from './tool-runtime/parser.js';
 
 // ─── Constants ───
 const DEFAULT_POLL_INTERVAL_MS = 500;
@@ -17,7 +28,7 @@ const STARTUP_WAIT_INTERVAL_MS = 2000;
 const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
 
-const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge.';
+const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
 
 // ─── Utilities ───
 function sleep(ms) {
@@ -65,10 +76,7 @@ async function getImageDataUri(url) {
 function normalizeTextContent(content) {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
-        return content
-            .filter((p) => p && p.type === 'text')
-            .map((p) => p.text || '')
-            .join('');
+        return content.filter((p) => p && p.type === 'text').map((p) => p.text || '').join('');
     }
     return '';
 }
@@ -79,6 +87,12 @@ function normalizeReasoningEffort(effort, fallback) {
     if (['low', 'medium', 'high'].includes(e)) return e;
     if (e === 'none') return 'none';
     return fallback;
+}
+
+function normalizeToolArguments(rawArgs) {
+    if (rawArgs === undefined || rawArgs === null || rawArgs === '') return '{}';
+    if (typeof rawArgs === 'object') return JSON.stringify(rawArgs);
+    return typeof rawArgs === 'string' ? rawArgs : '{}';
 }
 
 // ─── Mutex Queue ───
@@ -125,11 +139,42 @@ function lock(task, timeout = 120000) {
     });
 }
 
-// ─── Backend Auth ───
+// ─── Backend Tool Disable ───
+const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
+let cachedDisabledToolOverrides = null;
+let cachedDisabledToolOverridesAt = 0;
+
+async function getBackendToolIds(client, config) {
+    try {
+        const idsRes = await client.tool.ids();
+        const ids = Array.isArray(idsRes?.data) ? idsRes.data : Array.isArray(idsRes) ? idsRes : [];
+        logDebug(config, 'Backend tool IDs loaded', { count: ids.length });
+        return ids;
+    } catch (e) {
+        logDebug(config, 'Failed to get backend tool IDs:', e.message);
+        return [];
+    }
+}
+
+async function getDisabledToolOverrides(client, config) {
+    if (cachedDisabledToolOverrides && Date.now() - cachedDisabledToolOverridesAt < TOOL_IDS_CACHE_MS) {
+        return cachedDisabledToolOverrides;
+    }
+    const ids = await getBackendToolIds(client, config);
+    if (!Array.isArray(ids) || ids.length === 0) return null;
+    const overrides = {};
+    ids.forEach((id) => { overrides[id] = false; });
+    cachedDisabledToolOverrides = overrides;
+    cachedDisabledToolOverridesAt = Date.now();
+    logDebug(config, 'Disabled tool overrides built', { count: ids.length });
+    return overrides;
+}
+
+// ─── Backend Auth & Management ───
 function buildBackendAuthHeaders(password) {
     if (!password) return undefined;
     const token = Buffer.from(`mimocode:${password}`).toString('base64');
-    return { Authorization: `Basic ${token}` };
+    return { Authorization: ['Basic', token].join(' ') };
 }
 
 function checkHealth(serverUrl, password) {
@@ -137,7 +182,6 @@ function checkHealth(serverUrl, password) {
         const headers = buildBackendAuthHeaders(password);
         const options = headers ? { headers } : undefined;
         const req = http.get(`${serverUrl}/health`, options, (res) => {
-            // 200 = fully healthy, 503 = API ready but Web UI unavailable (headless mode)
             if (res.statusCode === 200 || res.statusCode === 503) resolve(true);
             else reject(new Error(`Status ${res.statusCode}`));
         });
@@ -149,7 +193,6 @@ function checkHealth(serverUrl, password) {
     });
 }
 
-// ─── Backend Management ───
 let backendProcess = null;
 let backendStarted = false;
 
@@ -161,7 +204,6 @@ async function ensureBackend(config) {
         }
         return;
     }
-
     if (backendStarted && backendProcess) {
         try {
             await checkHealth(config.MIMOCODE_SERVER_URL, config.MIMOCODE_SERVER_PASSWORD);
@@ -171,31 +213,13 @@ async function ensureBackend(config) {
             backendProcess = null;
         }
     }
-
     const serverPort = new URL(config.MIMOCODE_SERVER_URL).port || '10001';
     const args = ['serve', '--hostname', '127.0.0.1', '--port', serverPort];
-    const env = {
-        ...process.env,
-        MIMOCODE_MIMO_ONLY: 'true',
-        MIMOCODE_SERVER_PASSWORD: config.MIMOCODE_SERVER_PASSWORD,
-    };
-
+    const env = { ...process.env, MIMOCODE_MIMO_ONLY: 'true', MIMOCODE_SERVER_PASSWORD: config.MIMOCODE_SERVER_PASSWORD };
     backendProcess = spawn(config.MIMOCODE_PATH, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
-
-    backendProcess.stdout?.on('data', (data) => {
-        const line = data.toString().trim();
-        if (line) console.log(`[MiMo Backend] ${line}`);
-    });
-    backendProcess.stderr?.on('data', (data) => {
-        const line = data.toString().trim();
-        if (line) console.error(`[MiMo Backend] ${line}`);
-    });
-    backendProcess.on('exit', (code) => {
-        console.error(`[MiMo Backend] exited with code ${code}`);
-        backendStarted = false;
-        backendProcess = null;
-    });
-
+    backendProcess.stdout?.on('data', (data) => { const line = data.toString().trim(); if (line) console.log(`[MiMo Backend] ${line}`); });
+    backendProcess.stderr?.on('data', (data) => { const line = data.toString().trim(); if (line) console.error(`[MiMo Backend] ${line}`); });
+    backendProcess.on('exit', (code) => { console.error(`[MiMo Backend] exited with code ${code}`); backendStarted = false; backendProcess = null; });
     await waitForBackend(config.MIMOCODE_SERVER_URL, config.MIMOCODE_SERVER_PASSWORD, STARTING_WAIT_ITERATIONS, STARTING_WAIT_INTERVAL_MS);
     backendStarted = true;
     console.log('[Proxy] MiMo backend is up!');
@@ -203,12 +227,7 @@ async function ensureBackend(config) {
 
 async function waitForBackend(url, password, maxIterations, intervalMs) {
     for (let i = 0; i < maxIterations; i++) {
-        try {
-            await checkHealth(url, password);
-            return;
-        } catch {
-            await sleep(intervalMs);
-        }
+        try { await checkHealth(url, password); return; } catch { await sleep(intervalMs); }
     }
     throw new Error(`Timeout waiting for MiMo backend at ${url}`);
 }
@@ -216,13 +235,8 @@ async function waitForBackend(url, password, maxIterations, intervalMs) {
 // ─── Cleanup ───
 function cleanupTempDirs() {
     const jailRoot = path.join(os.tmpdir(), 'mimocode-proxy-jail');
-    try {
-        if (fs.existsSync(jailRoot)) fs.rmSync(jailRoot, { recursive: true, force: true });
-    } catch (e) {
-        console.error('[Cleanup] Failed to remove temp dirs:', e.message);
-    }
+    try { if (fs.existsSync(jailRoot)) fs.rmSync(jailRoot, { recursive: true, force: true }); } catch {}
 }
-
 process.on('exit', cleanupTempDirs);
 if (process.platform !== 'win32') {
     process.on('SIGINT', () => { cleanupTempDirs(); process.exit(0); });
@@ -237,10 +251,11 @@ function extractFromParts(parts) {
     return { content, reasoning };
 }
 
-async function buildPromptParts(rawMessages) {
+async function buildPromptParts(rawMessages, externalToolRegistry = []) {
     const parts = [];
     const systemChunks = [];
     const userContents = [];
+    const assistantToolCalls = new Map();
 
     const formatRoleLine = (role, name, text) => {
         const roleLabel = role.toUpperCase();
@@ -261,12 +276,11 @@ async function buildPromptParts(rawMessages) {
         if (role === 'assistant' && Array.isArray(m?.tool_calls) && m.tool_calls.length) {
             const serialized = m.tool_calls.map((tc, index) => ({
                 id: tc?.id || `call_${index + 1}`,
-                name: tc?.function?.name || tc?.name,
-                arguments: typeof tc?.function?.arguments === 'string'
-                    ? tc?.function?.arguments
-                    : JSON.stringify(tc?.function?.arguments ?? tc?.arguments ?? {}),
+                name: findExternalToolByName(externalToolRegistry, tc?.function?.name || tc?.name)?.namespacedName || tc?.function?.name || tc?.name,
+                arguments: normalizeToolArguments(tc?.function?.arguments ?? tc?.arguments)
             })).filter(tc => tc.name);
             if (serialized.length) {
+                serialized.forEach(tc => assistantToolCalls.set(tc.id, tc.name));
                 parts.push({ type: 'text', text: `ASSISTANT: <function_calls>${JSON.stringify(serialized)}</function_calls>` });
             }
         }
@@ -274,7 +288,9 @@ async function buildPromptParts(rawMessages) {
         if (role === 'tool') {
             const text = normalizeTextContent(content);
             if (text) {
-                const toolName = m?.name || 'unknown';
+                const mappedTool = findExternalToolByName(externalToolRegistry, m?.name)
+                    || findExternalToolByName(externalToolRegistry, assistantToolCalls.get(m?.tool_call_id));
+                const toolName = mappedTool?.namespacedName || assistantToolCalls.get(m?.tool_call_id) || m?.name || 'external__unknown';
                 const toolCallId = m?.tool_call_id || `call_${toolName.replace(/[^a-zA-Z0-9_]/g, '_')}`;
                 parts.push({ type: 'text', text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: toolCallId, name: toolName, content: text })}` });
             }
@@ -317,14 +333,12 @@ async function buildPromptParts(rawMessages) {
     };
 }
 
-function buildSystemPrompt(config, baseSystem, reasoningEffort) {
-    if (config.OMIT_SYSTEM_PROMPT) return '';
+function buildSystemPrompt(config, baseSystem, reasoningEffort, toolMode, externalToolPrompt) {
     const chunks = [];
     if (baseSystem) chunks.push(baseSystem);
-    if (config.DISABLE_TOOLS) chunks.push(TOOL_GUARD_MESSAGE);
-    if (reasoningEffort && reasoningEffort !== 'none') {
-        chunks.push(`Reasoning effort: ${reasoningEffort}`);
-    }
+    if (externalToolPrompt) chunks.push(externalToolPrompt);
+    if (toolMode === 'disabled' && config.DISABLE_TOOLS) chunks.push(TOOL_GUARD_MESSAGE);
+    if (reasoningEffort && reasoningEffort !== 'none') chunks.push(`Reasoning effort: ${reasoningEffort}`);
     return chunks.join('\n\n');
 }
 
@@ -358,27 +372,23 @@ async function resolveRequestedModel(client, requestedModel) {
 
     const fallbackModel = models[0]?.id || 'mimo/mimo-auto';
     let [providerID, modelID] = (requestedModel || fallbackModel).split('/');
-    if (!modelID) {
-        modelID = providerID;
-        providerID = 'mimo';
-    }
+    if (!modelID) { modelID = providerID; providerID = 'mimo'; }
     const normalizedModelID = normalizeModelID(modelID);
     const candidateModelIDs = [...new Set([modelID, normalizedModelID].filter(Boolean))];
 
-    const exact = models.find((m) => candidateModelIDs.some((candidate) => m.id === `${providerID}/${candidate}`));
+    const exact = models.find((m) => candidateModelIDs.some((c) => m.id === `${providerID}/${c}`));
     if (exact) {
         const [, resolvedModelID] = exact.id.split('/');
         return { providerID, modelID: resolvedModelID, models, resolved: exact.id };
     }
 
     const sameProvider = models.filter((m) => m.owned_by === providerID);
-    const suffixMatch = sameProvider.find((m) => candidateModelIDs.some((candidate) => m.id.endsWith(`/${candidate}-free`) || m.id.endsWith(`/${candidate}`)));
+    const suffixMatch = sameProvider.find((m) => candidateModelIDs.some((c) => m.id.endsWith(`/${c}-free`) || m.id.endsWith(`/${c}`)));
     if (suffixMatch) {
         const [, resolvedModelID] = suffixMatch.id.split('/');
         return { providerID, modelID: resolvedModelID, models, resolved: suffixMatch.id };
     }
 
-    // Default to mimo/mimo-auto
     if (models.find(m => m.id === 'mimo/mimo-auto')) {
         return { providerID: 'mimo', modelID: 'mimo-auto', models, resolved: 'mimo/mimo-auto' };
     }
@@ -414,7 +424,6 @@ async function pollForAssistantResponse(client, config, sessionId, timeoutMs, in
         }
         await sleep(intervalMs);
     }
-    logDebug(config, 'Polling timeout', { sessionId, ms: Date.now() - pollStart });
     throw new Error(`Request timeout after ${timeoutMs}ms`);
 }
 
@@ -433,15 +442,13 @@ async function collectFromEvents(client, config, sessionId, timeoutMs, onDelta, 
     return new Promise((resolve, reject) => {
         const timeoutId = setTimeout(() => {
             if (finished) return;
-            finished = true;
-            controller.abort();
+            finished = true; controller.abort();
             reject(new Error(`Request timeout after ${timeoutMs}ms`));
         }, timeoutMs);
 
         const firstDeltaTimer = firstDeltaTimeoutMs ? setTimeout(() => {
             if (finished || receivedDelta) return;
-            finished = true;
-            controller.abort();
+            finished = true; controller.abort();
             logDebug(config, 'No event data received', { sessionId, ms: Date.now() - startedAt });
             resolve({ content: '', reasoning: '', noData: true });
         }, firstDeltaTimeoutMs) : null;
@@ -452,8 +459,7 @@ async function collectFromEvents(client, config, sessionId, timeoutMs, onDelta, 
             if (idleTimer) clearTimeout(idleTimer);
             idleTimer = setTimeout(() => {
                 if (finished) return;
-                finished = true;
-                controller.abort();
+                finished = true; controller.abort();
                 logDebug(config, 'Event idle timeout', { sessionId, ms: Date.now() - startedAt, deltaChars });
                 resolve({ content, reasoning, idleTimeout: true, receivedDelta });
             }, idleTimeoutMs);
@@ -468,26 +474,15 @@ async function collectFromEvents(client, config, sessionId, timeoutMs, onDelta, 
                             receivedDelta = true;
                             if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                             scheduleIdleTimer();
-                            if (!firstDeltaAt) {
-                                firstDeltaAt = Date.now();
-                                logDebug(config, 'SSE first delta', { sessionId, ms: firstDeltaAt - startedAt, type: part.type });
-                            }
-                            if (part.type === 'reasoning') {
-                                reasoning += delta;
-                                onDelta(delta, true);
-                            } else {
-                                content += delta;
-                                onDelta(delta, false);
-                            }
+                            if (!firstDeltaAt) { firstDeltaAt = Date.now(); logDebug(config, 'SSE first delta', { sessionId, ms: firstDeltaAt - startedAt, type: part.type }); }
+                            if (part.type === 'reasoning') { reasoning += delta; onDelta(delta, true); }
+                            else { content += delta; onDelta(delta, false); }
                             deltaChars += delta.length;
                         }
                     }
-                    if (event.type === 'message.updated' &&
-                        event.properties?.info?.sessionID === sessionId &&
-                        event.properties.info.finish === 'stop') {
+                    if (event.type === 'message.updated' && event.properties?.info?.sessionID === sessionId && event.properties.info.finish === 'stop') {
                         if (!finished) {
-                            finished = true;
-                            clearTimeout(timeoutId);
+                            finished = true; clearTimeout(timeoutId);
                             if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                             if (idleTimer) clearTimeout(idleTimer);
                             logDebug(config, 'SSE completed', { sessionId, ms: Date.now() - startedAt, deltaChars });
@@ -498,8 +493,7 @@ async function collectFromEvents(client, config, sessionId, timeoutMs, onDelta, 
                 }
             } catch (e) {
                 if (!finished) {
-                    finished = true;
-                    clearTimeout(timeoutId);
+                    finished = true; clearTimeout(timeoutId);
                     if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                     if (idleTimer) clearTimeout(idleTimer);
                     reject(e);
@@ -512,12 +506,50 @@ async function collectFromEvents(client, config, sessionId, timeoutMs, onDelta, 
 // ─── SSE Chunk Helper ───
 function sseChunk(id, model, delta, finishReason = null) {
     return `data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model,
+        id, object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000), model,
         choices: [{ index: 0, delta, finish_reason: finishReason }]
     })}\n\n`;
+}
+
+// ─── Tool Call Helpers ───
+function toPublicToolCalls(toolCalls) {
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
+    return toolCalls.map((tc) => ({
+        id: tc.id, type: 'function',
+        function: { name: tc.function.name, arguments: tc.function.arguments }
+    }));
+}
+
+function finalizeValidatedToolCalls(parsedToolCalls, registry, config) {
+    const { validCalls, invalidCalls } = validateToolCalls(parsedToolCalls, registry);
+    invalidCalls.forEach(({ call, validation }) => {
+        logDebug(config, 'Rejected external tool call', {
+            tool: call?.function?.name,
+            errors: validation?.errors?.map((e) => e.message)
+        });
+    });
+    const allowedCalls = [];
+    validCalls.forEach((tc) => {
+        const policyDecision = evaluateToolPolicy(tc.tool, tc.validatedArguments, { config });
+        if (policyDecision.status === 'allow') {
+            allowedCalls.push(tc);
+        } else {
+            logDebug(config, 'Blocked external tool call', {
+                tool: tc.function.name, status: policyDecision.status, reason: policyDecision.reason
+            });
+        }
+    });
+    return { validCalls: allowedCalls, invalidCalls };
+}
+
+function stripFunctionCalls(text) {
+    if (!text) return text;
+    // Strip XML-tagged function calls
+    let cleaned = text.replace(/<function_calls?>[\s\S]*?<\/function_calls?>/g, '');
+    // Strip bare JSON tool calls: {"name":"external__...","arguments":{...}}
+    cleaned = cleaned.replace(/\{[^{}]*"name"\s*:\s*"external__[^"]+"[^{}]*"arguments"\s*:\s*\{[^{}]*\}[^{}]*\}/g, '');
+    return cleaned.trim();
 }
 
 // ─── Create App ───
@@ -531,9 +563,7 @@ export function createApp(config) {
 
     // Auth middleware
     app.use((req, res, next) => {
-        if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/v1/models') {
-            return next();
-        }
+        if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/v1/models') return next();
         if (config.API_KEY && config.API_KEY.trim() !== '') {
             const authHeader = req.headers.authorization;
             if (!authHeader || authHeader !== `Bearer ${config.API_KEY}`) {
@@ -543,19 +573,16 @@ export function createApp(config) {
         next();
     });
 
-    // Health endpoint
+    // Health
     app.get('/health', (_req, res) => res.json({ status: 'ok', proxy: true }));
     app.get('/', (_req, res) => res.json({ status: 'ok', proxy: true }));
 
-    // Models endpoint
+    // Models
     app.get('/v1/models', async (_req, res) => {
         try {
             const providersRes = await client.config.providers();
             const providersRaw = providersRes.data?.providers || [];
-            const providersList = Array.isArray(providersRaw)
-                ? providersRaw
-                : Object.entries(providersRaw).map(([id, info]) => ({ ...info, id }));
-
+            const providersList = Array.isArray(providersRaw) ? providersRaw : Object.entries(providersRaw).map(([id, info]) => ({ ...info, id }));
             const models = [];
             providersList.forEach((p) => {
                 if (p.models) {
@@ -577,7 +604,7 @@ export function createApp(config) {
         }
     });
 
-    // Chat completions endpoint
+    // Chat completions
     app.post('/v1/chat/completions', async (req, res) => {
         try {
             await lock(async () => {
@@ -590,7 +617,7 @@ export function createApp(config) {
                 let keepaliveInterval = null;
 
                 try {
-                    const { messages, model, stream: requestStream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, reasoning_effort, reasoning } = req.body;
+                    const { messages, model, tools = [], tool_choice, stream: requestStream, temperature, max_tokens, top_p, stop, reasoning_effort, reasoning } = req.body;
                     stream = Boolean(requestStream);
 
                     if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -598,51 +625,56 @@ export function createApp(config) {
                     }
 
                     const reasoningLevel = normalizeReasoningEffort(reasoning_effort || reasoning?.effort, null);
-                    const requestParams = {
-                        temperature: typeof temperature === 'number' ? temperature : 0.7,
-                        max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
-                        top_p: typeof top_p === 'number' ? top_p : 1.0,
-                        stop: Array.isArray(stop) ? stop : (stop ? [stop] : null),
-                        reasoning_effort: reasoningLevel
-                    };
 
-                    logDebug(config, 'Request params', { temperature: requestParams.temperature, max_tokens: requestParams.max_tokens, reasoning_effort: reasoningLevel });
+                    // Build external tool registry
+                    const externalToolRegistry = buildExternalToolRegistry(tools);
+                    const externalToolExposure = buildToolExposure(externalToolRegistry, tool_choice);
+                    const externalToolChoice = externalToolExposure.toolChoice;
+
+                    const hasExternalTools = externalToolRegistry.length > 0;
+                    const toolMode = (!config.DISABLE_TOOLS && hasExternalTools) ? 'external-bridge' : 'disabled';
+
+                    logDebug(config, 'Tool mode', { toolMode, externalTools: externalToolRegistry.length, toolChoice: tool_choice });
 
                     const resolvedModel = await resolveRequestedModel(client, model);
                     pID = resolvedModel.providerID;
                     mID = resolvedModel.modelID;
-                    if (resolvedModel.aliasFrom) {
-                        logDebug(config, 'Resolved model alias', { from: resolvedModel.aliasFrom, to: resolvedModel.resolved });
-                    }
 
-                    const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildPromptParts(messages);
-                    const systemWithGuard = buildSystemPrompt(config, systemMsg, reasoningLevel);
+                    const { parts, system: systemMsg, fullPromptText } = await buildPromptParts(messages, externalToolRegistry);
+
+                    const systemWithGuard = buildSystemPrompt(
+                        config, systemMsg, reasoningLevel,
+                        toolMode,
+                        hasExternalTools ? externalToolExposure.prompt : null
+                    );
 
                     if (!parts.length) {
                         return res.status(400).json({ error: { message: 'messages must include at least one non-system text message' } });
                     }
 
                     logDebug(config, 'Request start', {
-                        model: `${pID}/${mID}`, stream: Boolean(stream), userMessages: messages.length,
-                        system: Boolean(systemMsg), parts: parts.length, disableTools: config.DISABLE_TOOLS,
+                        model: `${pID}/${mID}`, stream, userMessages: messages.length,
+                        system: Boolean(systemMsg), parts: parts.length, toolMode, externalTools: externalToolRegistry.length
                     });
 
                     await ensureBackend(config);
 
-                    // Set active model
                     try {
                         await client.config.update({ body: { activeModel: { providerID: pID, modelID: mID } } });
                     } catch (confError) {
                         logDebug(config, 'Failed to set active model:', confError.message);
                     }
 
-                    // Create session
                     const sessionRes = await client.session.create();
                     sessionId = sessionRes.data?.id;
                     if (!sessionId) throw new Error('Failed to create MiMo session');
                     logDebug(config, 'Session created', { sessionId });
 
                     id = `chatcmpl-${Date.now()}`;
+                    const modelStr = `${pID}/${mID}`;
+
+                    // Disable all backend built-in tools so only external (client) tools work
+                    const disabledToolOverrides = await getDisabledToolOverrides(client, config);
 
                     const promptParams = {
                         path: { id: sessionId },
@@ -650,14 +682,13 @@ export function createApp(config) {
                             model: { providerID: pID, modelID: mID },
                             system: systemWithGuard,
                             parts: parts,
-                            ...(requestParams.max_tokens && { max_tokens: requestParams.max_tokens }),
-                            ...(requestParams.temperature !== undefined && { temperature: requestParams.temperature }),
-                            ...(requestParams.top_p !== undefined && { top_p: requestParams.top_p }),
-                            ...(requestParams.stop && { stop: requestParams.stop })
+                            ...(typeof temperature === 'number' && { temperature }),
+                            ...(typeof top_p === 'number' && { top_p }),
+                            ...(typeof max_tokens === 'number' && { max_tokens }),
+                            ...(stop && { stop }),
+                            ...(disabledToolOverrides && { tools: disabledToolOverrides })
                         }
                     };
-
-                    const modelStr = `${pID}/${mID}`;
 
                     if (stream) {
                         // ─── Streaming Response ───
@@ -667,8 +698,17 @@ export function createApp(config) {
 
                         let streamedContent = '';
                         let streamedReasoning = '';
+                        let rawStreamedContent = '';
+                        let rawStreamedReasoning = '';
                         let completionTokens = 0;
                         let reasoningTokens = 0;
+                        const streamedToolCalls = [];
+
+                        const shouldStripStreamingToolMarkup = hasExternalTools;
+                        const filterContentDelta = createToolCallFilter({ disableTools: config.DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
+                        const filterReasoningDelta = createToolCallFilter({ disableTools: config.DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
+                        const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+                        const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
 
                         const ensureKeepalive = () => {
                             if (!keepaliveInterval) {
@@ -681,32 +721,48 @@ export function createApp(config) {
 
                         const sendDelta = (delta, isReasoning = false) => {
                             if (!delta) return;
+                            if (isReasoning) rawStreamedReasoning += delta;
+                            else rawStreamedContent += delta;
+
+                            // Parse tool calls from stream
+                            const parsedDeltaToolCalls = isReasoning ? parseReasoningToolCalls(delta) : parseContentToolCalls(delta);
+                            parsedDeltaToolCalls.forEach((tc) => {
+                                streamedToolCalls.push(tc);
+                                res.write(sseChunk(id, modelStr, {
+                                    tool_calls: [{
+                                        index: streamedToolCalls.length - 1,
+                                        id: tc.id, type: 'function',
+                                        function: { name: tc.function.name, arguments: tc.function.arguments }
+                                    }]
+                                }));
+                            });
+
+                            const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                            if (!filtered) return;
+
                             if (isReasoning) {
                                 if (!insideReasoning) {
                                     res.write(sseChunk(id, modelStr, { content: '<think>\n' }));
                                     insideReasoning = true;
                                 }
-                                streamedReasoning += delta;
-                                reasoningTokens += Math.ceil(delta.length / 4);
+                                streamedReasoning += filtered;
+                                reasoningTokens += Math.ceil(filtered.length / 4);
                             } else {
                                 if (insideReasoning) {
                                     res.write(sseChunk(id, modelStr, { content: '\n</think>\n\n' }));
                                     insideReasoning = false;
                                 }
-                                streamedContent += delta;
-                                completionTokens += Math.ceil(delta.length / 4);
+                                streamedContent += filtered;
+                                completionTokens += Math.ceil(filtered.length / 4);
                             }
-                            res.write(sseChunk(id, modelStr, { content: delta }));
+                            res.write(sseChunk(id, modelStr, { content: filtered }));
                         };
 
                         let collected = null;
                         try {
                             const collectPromise = collectFromEvents(
-                                client, config, sessionId,
-                                config.REQUEST_TIMEOUT_MS,
-                                sendDelta,
-                                DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                DEFAULT_EVENT_IDLE_TIMEOUT_MS
+                                client, config, sessionId, config.REQUEST_TIMEOUT_MS,
+                                sendDelta, DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS, DEFAULT_EVENT_IDLE_TIMEOUT_MS
                             );
                             const safeCollect = collectPromise.catch((err) => ({ __error: err }));
                             client.session.prompt(promptParams).catch(err => logDebug(config, 'Prompt error:', err.message));
@@ -715,7 +771,7 @@ export function createApp(config) {
                             logDebug(config, 'Stream error:', e.message);
                         }
 
-                        // Fallback to polling if SSE fails
+                        // Fallback to polling
                         const handleFallback = async (reason) => {
                             logDebug(config, reason, { sessionId });
                             const { content, reasoning, error } = await pollForAssistantResponse(client, config, sessionId, config.REQUEST_TIMEOUT_MS);
@@ -723,11 +779,11 @@ export function createApp(config) {
                                 sendDelta(`[Proxy Error] ${error.name || 'MiMoError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else {
                                 if (reasoning) {
-                                    const rem = reasoning.startsWith(streamedReasoning) ? reasoning.slice(streamedReasoning.length) : reasoning;
+                                    const rem = reasoning.startsWith(rawStreamedReasoning) ? reasoning.slice(rawStreamedReasoning.length) : reasoning;
                                     if (rem) sendDelta(rem, true);
                                 }
                                 if (content) {
-                                    const rem = content.startsWith(streamedContent) ? content.slice(streamedContent.length) : content;
+                                    const rem = content.startsWith(rawStreamedContent) ? content.slice(rawStreamedContent.length) : content;
                                     if (rem) sendDelta(rem, false);
                                 }
                             }
@@ -750,20 +806,29 @@ export function createApp(config) {
                             res.write(sseChunk(id, modelStr, { content: '\n</think>\n\n' }));
                         }
 
+                        // Always re-parse tool calls from full text for accuracy
+                        let parsedToolCalls = hasExternalTools
+                            ? parseExternalToolCallsFromText(externalToolRegistry, rawStreamedReasoning, rawStreamedContent)
+                            : [];
+
+                        const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry, config);
+                        if (validatedStreamedToolCalls.length > 0) {
+                            const toolCallDeltas = validatedStreamedToolCalls.map((tc, index) => ({
+                                index, id: tc.id, type: 'function',
+                                function: { name: tc.function.name, arguments: tc.function.arguments }
+                            }));
+                            res.write(sseChunk(id, modelStr, { tool_calls: toolCallDeltas }));
+                        }
+
                         if (keepaliveInterval) clearInterval(keepaliveInterval);
 
                         const promptTokens = Math.ceil((fullPromptText || '').length / 4);
                         const totalTokens = promptTokens + completionTokens + reasoningTokens;
-                        res.write(sseChunk(id, modelStr, {}, 'stop'));
+                        const finishReason = validatedStreamedToolCalls.length > 0 ? 'tool_calls' : 'stop';
+                        res.write(sseChunk(id, modelStr, {}, finishReason));
                         res.write(`data: ${JSON.stringify({
-                            id,
-                            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                            usage: {
-                                prompt_tokens: promptTokens,
-                                completion_tokens: completionTokens + reasoningTokens,
-                                total_tokens: totalTokens,
-                                completion_tokens_details: { reasoning_tokens: reasoningTokens }
-                            }
+                            id, choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+                            usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens + reasoningTokens, total_tokens: totalTokens, completion_tokens_details: { reasoning_tokens: reasoningTokens } }
                         })}\n\n`);
                         res.write('data: [DONE]\n\n');
                         res.end();
@@ -779,40 +844,40 @@ export function createApp(config) {
                         const { content, reasoning, error } = await pollForAssistantResponse(client, config, sessionId, config.REQUEST_TIMEOUT_MS);
 
                         if (error && !content && !reasoning) {
-                            return res.status(502).json({
-                                error: {
-                                    message: error.data?.message || error.message || 'MiMo provider error',
-                                    type: error.name || 'MiMoError'
-                                }
-                            });
+                            return res.status(502).json({ error: { message: error.data?.message || error.message || 'MiMo provider error', type: error.name || 'MiMoError' } });
                         }
+
+                        // Parse tool calls
+                        const parsedToolCalls = hasExternalTools
+                            ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                            : [];
+                        const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry, config);
+
+                        const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
+                        const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
                         const promptTokens = Math.ceil((fullPromptText || '').length / 4);
-                        const completionTokensCalc = Math.ceil((content || '').length / 4);
-                        const reasoningTokensCalc = Math.ceil((reasoning || '').length / 4);
+                        const completionTokensCalc = Math.ceil((safeContent || '').length / 4);
+                        const reasoningTokensCalc = Math.ceil((safeReasoning || '').length / 4);
                         const totalTokens = promptTokens + completionTokensCalc + reasoningTokensCalc;
 
-                        let finalContent = content;
-                        if (reasoning) {
-                            finalContent = `<think>\n${reasoning}\n</think>\n\n${content}`;
+                        let finalContent = safeContent;
+                        if (safeReasoning) {
+                            finalContent = ['<think>', safeReasoning, '</think>', '', '', safeContent].join('\n');
                         }
+
+                        const publicToolCalls = toPublicToolCalls(validatedToolCalls);
+                        const assistantMessage = publicToolCalls.length > 0
+                            ? { role: 'assistant', content: finalContent || null, tool_calls: publicToolCalls }
+                            : { role: 'assistant', content: finalContent };
 
                         res.json({
                             id: `chatcmpl-${Date.now()}`,
                             object: 'chat.completion',
                             created: Math.floor(Date.now() / 1000),
                             model: modelStr,
-                            choices: [{
-                                index: 0,
-                                message: { role: 'assistant', content: finalContent },
-                                finish_reason: 'stop'
-                            }],
-                            usage: {
-                                prompt_tokens: promptTokens,
-                                completion_tokens: completionTokensCalc + reasoningTokensCalc,
-                                total_tokens: totalTokens,
-                                completion_tokens_details: { reasoning_tokens: reasoningTokensCalc }
-                            }
+                            choices: [{ index: 0, message: assistantMessage, finish_reason: publicToolCalls.length > 0 ? 'tool_calls' : 'stop' }],
+                            usage: { prompt_tokens: promptTokens, completion_tokens: completionTokensCalc + reasoningTokensCalc, total_tokens: totalTokens, completion_tokens_details: { reasoning_tokens: reasoningTokensCalc } }
                         });
                     }
                 } catch (error) {
@@ -825,29 +890,19 @@ export function createApp(config) {
                     if (error.message?.includes('Request timeout')) statusCode = 504;
 
                     if (!res.headersSent) {
-                        res.status(statusCode).json({
-                            error: {
-                                message: errorMessage,
-                                type: error.code || error.constructor.name,
-                                ...(error.availableModels && { available_models: error.availableModels })
-                            }
-                        });
+                        res.status(statusCode).json({ error: { message: errorMessage, type: error.code || error.constructor.name, ...(error.availableModels && { available_models: error.availableModels }) } });
                     } else if (!res.destroyed) {
                         res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`);
                         res.end();
                     }
                 } finally {
                     if (keepaliveInterval) clearInterval(keepaliveInterval);
-                    if (sessionId) {
-                        try { await client.session.delete({ path: { id: sessionId } }); } catch {}
-                    }
+                    if (sessionId) { try { await client.session.delete({ path: { id: sessionId } }); } catch {} }
                 }
             }, config.REQUEST_TIMEOUT_MS + 20000);
         } catch (error) {
             console.error('[Proxy] Request Handler Error:', error.message);
-            if (!res.headersSent) {
-                res.status(500).json({ error: { message: error.message, type: error.constructor.name } });
-            }
+            if (!res.headersSent) res.status(500).json({ error: { message: error.message, type: error.constructor.name } });
         }
     });
 
