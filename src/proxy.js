@@ -415,7 +415,8 @@ async function pollForAssistantResponse(client, config, sessionId, timeoutMs, in
                 const { content, reasoning } = extractFromParts(entry?.parts || []);
                 const error = info?.error || null;
                 const done = Boolean(info.finish || info.time?.completed || error);
-                if (done || content || reasoning) {
+                // Only return when done, or when there's actual content (not just reasoning in progress)
+                if (done || content) {
                     if (error) console.error('[Proxy] MiMo assistant error:', error);
                     logDebug(config, 'Polling completed', { sessionId, ms: Date.now() - pollStart, done, contentLen: content.length, reasoningLen: reasoning.length });
                     return { content, reasoning, error };
