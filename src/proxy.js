@@ -724,18 +724,8 @@ export function createApp(config) {
                             if (isReasoning) rawStreamedReasoning += delta;
                             else rawStreamedContent += delta;
 
-                            // Parse tool calls from stream
-                            const parsedDeltaToolCalls = isReasoning ? parseReasoningToolCalls(delta) : parseContentToolCalls(delta);
-                            parsedDeltaToolCalls.forEach((tc) => {
-                                streamedToolCalls.push(tc);
-                                res.write(sseChunk(id, modelStr, {
-                                    tool_calls: [{
-                                        index: streamedToolCalls.length - 1,
-                                        id: tc.id, type: 'function',
-                                        function: { name: tc.function.name, arguments: tc.function.arguments }
-                                    }]
-                                }));
-                            });
+                            // Skip incremental tool call parsing — it produces incomplete results.
+                            // Tool calls are parsed from the full text after collection completes.
 
                             const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                             if (!filtered) return;
