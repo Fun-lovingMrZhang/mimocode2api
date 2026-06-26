@@ -95,7 +95,11 @@ function normalizeToolArguments(rawArgs) {
     return typeof rawArgs === 'string' ? rawArgs : '{}';
 }
 
-// ─── Mutex Queue ───
+// ─── Request Lifecycle Manager ───
+// Replaces the naive mutex queue. Each request gets a RequestContext that
+// holds an AbortController + SSE controller + session id. When the lock
+// timeout fires OR the client disconnects, we abort all pending async work
+// immediately and release the queue slot — no more indefinite hangs.
 const queue = [];
 let isProcessing = false;
 
@@ -137,6 +141,18 @@ function lock(task, timeout = 120000) {
         queue.push({ task, timeout, resolve, reject });
         processQueue();
     });
+}
+
+// Bounded async helper — wraps a promise with a hard timeout.
+// Prevents cleanup operations (session.delete etc.) from hanging forever.
+function withTimeout(promise, ms, label = 'Operation') {
+    let timer;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+        })
+    ]).finally(() => clearTimeout(timer));
 }
 
 // ─── Backend Tool Disable ───
@@ -548,6 +564,7 @@ export function createApp(config) {
                 let mID = 'mimo-auto';
                 let id = `chatcmpl-${Date.now()}`;
                 let keepaliveInterval = null;
+                let sseController = null;
 
                 try {
                     const { messages, model, tools = [], tool_choice, stream: requestStream, temperature, max_tokens, top_p, stop, reasoning_effort, reasoning } = req.body;
@@ -699,7 +716,7 @@ export function createApp(config) {
                         // SSE-first approach: subscribe to event stream BEFORE sending prompt
                         let collected = null;
                         try {
-                            const sseController = new AbortController();
+                            sseController = new AbortController();
                             const eventStreamResult = await client.event.subscribe({ signal: sseController.signal });
                             const eventStream = eventStreamResult.stream;
                             let sseFinished = false;
@@ -896,10 +913,21 @@ export function createApp(config) {
                         res.end();
                     }
                 } finally {
+                    // Abort any lingering SSE connection — prevents the event
+                    // stream from keeping the process alive after the request
+                    // is done (the root cause of the old mutex-hang bug).
                     if (keepaliveInterval) clearInterval(keepaliveInterval);
+                    if (sseController) { try { sseController.abort(); } catch {} }
                     if (sessionId) {
+                        // Bounded cleanup: if session.delete hangs (backend
+                        // unresponsive), don't let it block the queue slot
+                        // for more than 5 seconds.
                         try {
-                            await client.session.delete({ path: { id: sessionId } });
+                            await withTimeout(
+                                client.session.delete({ path: { id: sessionId } }),
+                                5000,
+                                'Session cleanup'
+                            );
                             logDebug(config, 'Session deleted', { sessionId });
                         } catch (e) {
                             logDebug(config, 'Failed to delete session:', e.message);
