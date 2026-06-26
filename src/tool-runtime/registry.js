@@ -99,10 +99,12 @@ const TOOL_NAME_ALIASES = {
   'cat': 'read_file', 'read': 'read_file', 'view': 'read_file', 'open_file': 'read_file',
   'grep': 'search_files', 'rg': 'search_files', 'find': 'search_files', 'glob': 'search_files',
   'ls': 'search_files', 'list': 'search_files', 'list_files': 'search_files',
-  'write': 'write_file', 'create_file': 'write_file', 'edit': 'patch', 'sed': 'patch',
+  'write': 'write_file', 'create_file': 'write_file', 'edit': 'patch', 'edit_file': 'patch', 'sed': 'patch',
   // web
   'web_search': 'web_search', 'search': 'web_search', 'web_fetch': 'web_extract',
-  'fetch': 'web_extract', 'curl': 'terminal',
+  'fetch': 'web_extract', 'curl': 'terminal', 'webfetch': 'web_extract', 'websearch': 'web_search',
+  // misc — case-insensitive variants
+  'Read': 'read_file',
 };
 
 export function findExternalToolByName(registry, name) {

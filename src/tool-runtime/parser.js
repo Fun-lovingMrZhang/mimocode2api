@@ -65,8 +65,8 @@ export function stripFunctionCallMarkup(text, trim = true) {
     cleaned = cleaned.replace(/<parameter\s*=\s*[^>]+>[\s\S]*?<\/parameter>/g, '');
     cleaned = cleaned.replace(/<\/?parameter\s*=\s*[^>]*>/g, '');
     // Remove <param name="...">value</param> leftovers
-    cleaned = cleaned.replace(/<param(?:eter)?\s+name\s*=\s*["'][^"']+["']\s*>[\s\S]*?<\/param(?:eter)?>/g, '');
-    cleaned = cleaned.replace(/<\/?param(?:eter)?\s+name\s*=\s*["'][^"']*["']\s*>/g, '');
+    cleaned = cleaned.replace(/<param(?:eter)?\s+name\s*=\s*["'][^"']+["'][^>]*>[\s\S]*?<\/param(?:eter)?>/g, '');
+    cleaned = cleaned.replace(/<\/?param(?:eter)?\s+name\s*=\s*["'][^"']*["'][^>]*>/g, '');
     // Remove <arg name="...">...</arg> leftovers
     cleaned = cleaned.replace(/<arg\s+name=[^>]+>[\s\S]*?<\/arg>/g, '');
     cleaned = cleaned.replace(/<\/?arg\s+name=[^>]*>/g, '');
@@ -154,7 +154,7 @@ function extractCallsFromBlock(content) {
                     [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)].forEach((am) => {
                         argObj[am[1]] = am[2].trim();
                     });
-                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
+                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["'][^>]*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
                         argObj[am[1]] = am[2].trim();
                     });
                     [...rawArgs.matchAll(/<arg\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/arg>/g)].forEach((am) => {
@@ -245,7 +245,7 @@ export function parseToolCallsFromText(...chunks) {
                         argObj[am[1]] = am[2].trim();
                     });
                     // Format 2: <param name="key">value</param> or <parameter name="key">value</parameter>
-                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
+                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["'][^>]*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
                         argObj[am[1]] = am[2].trim();
                     });
                     // Format 3: <arg name="key">value</arg>
@@ -264,7 +264,7 @@ export function parseToolCallsFromText(...chunks) {
                 }
             } else {
                 // No argument container found — try bare param formats right after tool_name
-                const bareParams = [...afterName.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)];
+                const bareParams = [...afterName.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["'][^>]*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)];
                 if (bareParams.length > 0) {
                     const argObj = {};
                     bareParams.forEach((am) => { argObj[am[1]] = am[2].trim(); });
@@ -313,7 +313,7 @@ export function parseToolCallsFromText(...chunks) {
                     [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)].forEach((am) => {
                         argObj[am[1]] = am[2].trim();
                     });
-                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
+                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["'][^>]*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
                         argObj[am[1]] = am[2].trim();
                     });
                     [...rawArgs.matchAll(/<arg\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/arg>/g)].forEach((am) => {
@@ -323,7 +323,7 @@ export function parseToolCallsFromText(...chunks) {
                 }
             } else {
                 // No argument container found — try bare <param name="..."> tags right after function_name
-                const bareParams = [...afterName.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)];
+                const bareParams = [...afterName.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["'][^>]*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)];
                 if (bareParams.length > 0) {
                     const argObj = {};
                     bareParams.forEach((am) => { argObj[am[1]] = am[2].trim(); });
