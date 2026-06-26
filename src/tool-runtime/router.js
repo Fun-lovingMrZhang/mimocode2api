@@ -38,13 +38,14 @@ export function buildExternalToolsPrompt(registry, toolChoice = null) {
 
   return [
     'External tools are virtualized by this proxy. They are not OpenCode tools.',
-    'When you need an external tool, your entire assistant reply MUST be ONLY one or more <function_calls>...</function_calls> blocks.',
-    'Do NOT output <think>, explanations, markdown, prose, or any text before or after <function_calls> blocks when making a tool call.',
-    'Each block must contain JSON with this exact shape:',
-    '{"name":"external__tool_name","arguments":{}}',
+    'When you need to call an external tool, output ONLY one or more <function_calls>...</function_calls> blocks.',
+    'Do NOT wrap tool calls in JSON objects or any other format. Use ONLY <function_calls> XML blocks.',
+    'Each block must contain a JSON array with this exact shape:',
+    '[{"name":"external__tool_name","arguments":{}}]',
     'Arguments must be a valid JSON object that matches the declared schema.',
     'Use only the namespaced names listed below. Do not use original client tool names inside function calls.',
     'If tool results are later provided as TOOL_RESULT messages, use those results to continue normally.',
+    'You may include brief reasoning text before <function_calls> blocks to explain your intent.',
     ...choiceInstructions,
     `Available external tools: ${JSON.stringify(registry.map((tool) => ({
       name: tool.namespacedName,
@@ -54,7 +55,7 @@ export function buildExternalToolsPrompt(registry, toolChoice = null) {
       risk_level: tool.riskLevel,
       side_effect: tool.sideEffect,
       requires_confirmation: tool.requiresConfirmation
-    })))}`,
+    })))}`
   ].join('\n');
 }
 

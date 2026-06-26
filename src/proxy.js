@@ -255,7 +255,6 @@ async function buildPromptParts(rawMessages, externalToolRegistry = []) {
     const parts = [];
     const systemChunks = [];
     const userContents = [];
-    const assistantToolCalls = new Map();
 
     const formatRoleLine = (role, name, text) => {
         const roleLabel = role.toUpperCase();
@@ -280,7 +279,6 @@ async function buildPromptParts(rawMessages, externalToolRegistry = []) {
                 arguments: normalizeToolArguments(tc?.function?.arguments ?? tc?.arguments)
             })).filter(tc => tc.name);
             if (serialized.length) {
-                serialized.forEach(tc => assistantToolCalls.set(tc.id, tc.name));
                 parts.push({ type: 'text', text: `ASSISTANT: <function_calls>${JSON.stringify(serialized)}</function_calls>` });
             }
         }
@@ -288,9 +286,8 @@ async function buildPromptParts(rawMessages, externalToolRegistry = []) {
         if (role === 'tool') {
             const text = normalizeTextContent(content);
             if (text) {
-                const mappedTool = findExternalToolByName(externalToolRegistry, m?.name)
-                    || findExternalToolByName(externalToolRegistry, assistantToolCalls.get(m?.tool_call_id));
-                const toolName = mappedTool?.namespacedName || assistantToolCalls.get(m?.tool_call_id) || m?.name || 'external__unknown';
+                const mappedTool = findExternalToolByName(externalToolRegistry, m?.name);
+                const toolName = mappedTool?.namespacedName || m?.name || 'external__unknown';
                 const toolCallId = m?.tool_call_id || `call_${toolName.replace(/[^a-zA-Z0-9_]/g, '_')}`;
                 parts.push({ type: 'text', text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: toolCallId, name: toolName, content: text })}` });
             }
@@ -415,7 +412,6 @@ async function pollForAssistantResponse(client, config, sessionId, timeoutMs, in
                 const { content, reasoning } = extractFromParts(entry?.parts || []);
                 const error = info?.error || null;
                 const done = Boolean(info.finish || info.time?.completed || error);
-                // Only return when done, or when there's actual content (not just reasoning in progress)
                 if (done || content) {
                     if (error) console.error('[Proxy] MiMo assistant error:', error);
                     logDebug(config, 'Polling completed', { sessionId, ms: Date.now() - pollStart, done, contentLen: content.length, reasoningLen: reasoning.length });
@@ -428,88 +424,19 @@ async function pollForAssistantResponse(client, config, sessionId, timeoutMs, in
     throw new Error(`Request timeout after ${timeoutMs}ms`);
 }
 
-async function collectFromEvents(client, config, sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
-    const controller = new AbortController();
-    const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
-    const eventStream = eventStreamResult.stream;
-    let finished = false;
-    let content = '';
-    let reasoning = '';
-    let receivedDelta = false;
-    let deltaChars = 0;
-    let firstDeltaAt = null;
-    const startedAt = Date.now();
-
-    return new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-            if (finished) return;
-            finished = true; controller.abort();
-            reject(new Error(`Request timeout after ${timeoutMs}ms`));
-        }, timeoutMs);
-
-        const firstDeltaTimer = firstDeltaTimeoutMs ? setTimeout(() => {
-            if (finished || receivedDelta) return;
-            finished = true; controller.abort();
-            logDebug(config, 'No event data received', { sessionId, ms: Date.now() - startedAt });
-            resolve({ content: '', reasoning: '', noData: true });
-        }, firstDeltaTimeoutMs) : null;
-
-        let idleTimer = null;
-        const scheduleIdleTimer = () => {
-            if (!idleTimeoutMs) return;
-            if (idleTimer) clearTimeout(idleTimer);
-            idleTimer = setTimeout(() => {
-                if (finished) return;
-                finished = true; controller.abort();
-                logDebug(config, 'Event idle timeout', { sessionId, ms: Date.now() - startedAt, deltaChars });
-                resolve({ content, reasoning, idleTimeout: true, receivedDelta });
-            }, idleTimeoutMs);
-        };
-
-        (async () => {
-            try {
-                for await (const event of eventStream) {
-                    if (event.type === 'message.part.updated' && event.properties?.part?.sessionID === sessionId) {
-                        const { part, delta } = event.properties;
-                        if (delta) {
-                            receivedDelta = true;
-                            if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                            scheduleIdleTimer();
-                            if (!firstDeltaAt) { firstDeltaAt = Date.now(); logDebug(config, 'SSE first delta', { sessionId, ms: firstDeltaAt - startedAt, type: part.type }); }
-                            if (part.type === 'reasoning') { reasoning += delta; onDelta(delta, true); }
-                            else { content += delta; onDelta(delta, false); }
-                            deltaChars += delta.length;
-                        }
-                    }
-                    if (event.type === 'message.updated' && event.properties?.info?.sessionID === sessionId && event.properties.info.finish === 'stop') {
-                        if (!finished) {
-                            finished = true; clearTimeout(timeoutId);
-                            if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                            if (idleTimer) clearTimeout(idleTimer);
-                            logDebug(config, 'SSE completed', { sessionId, ms: Date.now() - startedAt, deltaChars });
-                            resolve({ content, reasoning });
-                        }
-                        break;
-                    }
-                }
-            } catch (e) {
-                if (!finished) {
-                    finished = true; clearTimeout(timeoutId);
-                    if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                    if (idleTimer) clearTimeout(idleTimer);
-                    reject(e);
-                }
-            }
-        })();
-    });
-}
-
-// ─── SSE Chunk Helper ───
+// ─── SSE Chunk Helpers ───
 function sseChunk(id, model, delta, finishReason = null) {
     return `data: ${JSON.stringify({
         id, object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000), model,
         choices: [{ index: 0, delta, finish_reason: finishReason }]
+    })}\n\n`;
+}
+
+function sseUsageChunk(id, model, finishReason, usage) {
+    return `data: ${JSON.stringify({
+        id, choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        usage
     })}\n\n`;
 }
 
@@ -546,10 +473,8 @@ function finalizeValidatedToolCalls(parsedToolCalls, registry, config) {
 
 function stripFunctionCalls(text) {
     if (!text) return text;
-    // Strip XML-tagged function calls
     let cleaned = text.replace(/<function_calls?>[\s\S]*?<\/function_calls?>/g, '');
-    // Strip bare JSON tool calls: {"name":"external__...","arguments":{...}}
-    cleaned = cleaned.replace(/\{[^{}]*"name"\s*:\s*"external__[^"]+"[^{}]*"arguments"\s*:\s*\{[^{}]*\}[^{}]*\}/g, '');
+    cleaned = cleaned.replace(/\{[^{}]*"name"\s*:\s*"external__[^\"]+"[^{}]*"arguments"\s*:\s*\{[^{}]*\}[^{}]*\}/g, '');
     return cleaned.trim();
 }
 
@@ -614,7 +539,6 @@ export function createApp(config) {
                 let pID = 'mimo';
                 let mID = 'mimo-auto';
                 let id = `chatcmpl-${Date.now()}`;
-                let insideReasoning = false;
                 let keepaliveInterval = null;
 
                 try {
@@ -697,19 +621,10 @@ export function createApp(config) {
                         res.setHeader('Cache-Control', 'no-cache');
                         res.setHeader('Connection', 'keep-alive');
 
-                        let streamedContent = '';
-                        let streamedReasoning = '';
-                        let rawStreamedContent = '';
-                        let rawStreamedReasoning = '';
                         let completionTokens = 0;
                         let reasoningTokens = 0;
-                        const streamedToolCalls = [];
-
-                        const shouldStripStreamingToolMarkup = hasExternalTools;
-                        const filterContentDelta = createToolCallFilter({ disableTools: config.DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
-                        const filterReasoningDelta = createToolCallFilter({ disableTools: config.DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
-                        const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
-                        const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+                        let rawContent = '';
+                        let rawReasoning = '';
 
                         const ensureKeepalive = () => {
                             if (!keepaliveInterval) {
@@ -720,40 +635,42 @@ export function createApp(config) {
                         };
                         ensureKeepalive();
 
-                        const sendDelta = (delta, isReasoning = false) => {
+                        // Buffer-based tool call markup filter for content deltas.
+                        // When external tools are active, the model may emit <function_calls>...</function_calls>
+                        // blocks mixed into its text output. We must strip these from the visible content
+                        // stream and only deliver them as structured tool_calls deltas at the end.
+                        // Also strip thinking-face markers (🤔 U+1F914) that the backend may insert
+                        // at reasoning/text boundaries.
+                        const THINKING_MARKER = /\u{1F914}/gu;
+                        const contentFilter = hasExternalTools
+                            ? createToolCallFilter({ disableTools: false, forceStrip: true })
+                            : null;
+
+                        const sendContentDelta = (delta) => {
                             if (!delta) return;
-                            if (isReasoning) rawStreamedReasoning += delta;
-                            else rawStreamedContent += delta;
-
-                            // Skip incremental tool call parsing — it produces incomplete results.
-                            // Tool calls are parsed from the full text after collection completes.
-
-                            const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
-                            if (!filtered) return;
-
-                            if (isReasoning) {
-                                if (!insideReasoning) {
-                                    res.write(sseChunk(id, modelStr, { content: '<think>\n' }));
-                                    insideReasoning = true;
-                                }
-                                streamedReasoning += filtered;
-                                reasoningTokens += Math.ceil(filtered.length / 4);
-                            } else {
-                                if (insideReasoning) {
-                                    res.write(sseChunk(id, modelStr, { content: '\n</think>\n\n' }));
-                                    insideReasoning = false;
-                                }
-                                streamedContent += filtered;
+                            // Strip thinking-face markers from content stream
+                            let cleaned = delta.replace(THINKING_MARKER, '');
+                            if (!cleaned) return;
+                            rawContent += cleaned;
+                            const filtered = contentFilter ? contentFilter(cleaned) : cleaned;
+                            if (filtered) {
                                 completionTokens += Math.ceil(filtered.length / 4);
+                                res.write(sseChunk(id, modelStr, { content: filtered }));
                             }
-                            res.write(sseChunk(id, modelStr, { content: filtered }));
+                        };
+
+                        const sendReasoningDelta = (delta) => {
+                            if (!delta) return;
+                            rawReasoning += delta;
+                            reasoningTokens += Math.ceil(delta.length / 4);
+                            // Send reasoning via the standard OpenAI extension field
+                            // reasoning_content, NOT mixed into content.
+                            res.write(sseChunk(id, modelStr, { reasoning_content: delta }));
                         };
 
                         // SSE-first approach: subscribe to event stream BEFORE sending prompt
-                        // to avoid missing early events. Fall back to polling if SSE fails.
                         let collected = null;
                         try {
-                            // 1. Subscribe to SSE event stream first
                             const sseController = new AbortController();
                             const eventStreamResult = await client.event.subscribe({ signal: sseController.signal });
                             const eventStream = eventStreamResult.stream;
@@ -762,50 +679,51 @@ export function createApp(config) {
                             let sseReasoning = '';
                             let sseReceivedDelta = false;
 
-                            // 2. Start SSE consumer in background
+                            const partTypeMap = new Map();
+
                             const ssePromise = (async () => {
                                 try {
-                                    // Map partID -> part type (reasoning/text) from part.updated events
-                                    const partTypeMap = new Map();
                                     for await (const event of eventStream) {
                                         if (event.type === 'message.part.updated' && event.properties?.part?.sessionID === sessionId) {
                                             const { part, delta } = event.properties;
-                                            // Track part type by partID
                                             if (part?.id && part?.type) {
                                                 partTypeMap.set(part.id, part.type);
                                             }
-                                            // Some part.updated events also carry delta
                                             if (delta) {
                                                 sseReceivedDelta = true;
                                                 const partType = part?.type || 'text';
                                                 if (partType === 'reasoning') {
                                                     sseReasoning += delta;
-                                                    sendDelta(delta, true);
+                                                    sendReasoningDelta(delta);
                                                 } else {
                                                     sseContent += delta;
-                                                    sendDelta(delta, false);
+                                                    sendContentDelta(delta);
                                                 }
                                             }
                                         }
-                                        // message.part.delta carries the actual incremental text
                                         if (event.type === 'message.part.delta') {
                                             const props = event.properties;
                                             if (props?.sessionID === sessionId && props?.delta) {
                                                 sseReceivedDelta = true;
-                                                // Determine if this delta is for reasoning or text part
-                                                const partType = partTypeMap.get(props.partID) || 'text';
+                                                // Determine part type: prefer partTypeMap (from
+                                                // message.part.updated), then fall back to field.
+                                                // Note: field is always 'text' in current MiMo backend
+                                                // even for reasoning parts, so partTypeMap is authoritative.
+                                                const partType = partTypeMap.get(props.partID) || props.field || 'text';
                                                 if (partType === 'reasoning') {
                                                     sseReasoning += props.delta;
-                                                    sendDelta(props.delta, true);
+                                                    sendReasoningDelta(props.delta);
                                                 } else {
                                                     sseContent += props.delta;
-                                                    sendDelta(props.delta, false);
+                                                    sendContentDelta(props.delta);
                                                 }
                                             }
                                         }
-                                        if (event.type === 'message.updated' &&
-                                            event.properties?.info?.sessionID === sessionId &&
-                                            event.properties.info.finish === 'stop') {
+                                        // session.idle is the true completion signal.
+                                        // message.updated with finish=stop fires per-step and may
+                                        // fire before all part deltas have been delivered.
+                                        if (event.type === 'session.idle' &&
+                                            event.properties?.sessionID === sessionId) {
                                             sseFinished = true;
                                             break;
                                         }
@@ -815,12 +733,9 @@ export function createApp(config) {
                                 }
                             })();
 
-                            // 3. Send prompt after SSE is connected
-                            // Wait a tick to let SSE connection establish
                             await new Promise(r => setTimeout(r, 100));
                             client.session.prompt(promptParams).catch(err => logDebug(config, 'Prompt error:', err.message));
 
-                            // 4. Wait for SSE to complete or timeout
                             const sseTimeout = new Promise(resolve => setTimeout(() => resolve('timeout'), config.REQUEST_TIMEOUT_MS));
                             const sseResult = await Promise.race([ssePromise.then(() => 'done'), sseTimeout]);
 
@@ -828,23 +743,21 @@ export function createApp(config) {
                                 collected = { content: sseContent, reasoning: sseReasoning };
                                 logDebug(config, 'SSE completed', { sessionId, deltaChars: sseContent.length + sseReasoning.length });
                             } else {
-                                // SSE didn't get data or timed out — abort and poll
                                 sseController.abort();
                                 logDebug(config, 'SSE fallback to polling', { sessionId, sseReceivedDelta, sseResult });
                                 const { content, reasoning, error } = await pollForAssistantResponse(client, config, sessionId, config.REQUEST_TIMEOUT_MS);
                                 collected = { content, reasoning, error };
-                                // Send any content not already streamed via SSE
                                 if (reasoning && reasoning.startsWith(sseReasoning)) {
                                     const rem = reasoning.slice(sseReasoning.length);
-                                    if (rem) sendDelta(rem, true);
+                                    if (rem) sendReasoningDelta(rem);
                                 } else if (reasoning && !sseReasoning) {
-                                    sendDelta(reasoning, true);
+                                    sendReasoningDelta(reasoning);
                                 }
                                 if (content && content.startsWith(sseContent)) {
                                     const rem = content.slice(sseContent.length);
-                                    if (rem) sendDelta(rem, false);
+                                    if (rem) sendContentDelta(rem);
                                 } else if (content && !sseContent) {
-                                    sendDelta(content, false);
+                                    sendContentDelta(content);
                                 }
                             }
                         } catch (e) {
@@ -854,21 +767,17 @@ export function createApp(config) {
 
                         // Handle errors
                         if (collected?.__error) {
-                            sendDelta(`[Proxy Error] ${collected.__error.message || 'Unknown error'}`);
+                            sendContentDelta(`[Proxy Error] ${collected.__error.message || 'Unknown error'}`);
                         } else if (collected?.error && !collected.content && !collected.reasoning) {
-                            sendDelta(`[Proxy Error] ${collected.error.name || 'MiMoError'}: ${collected.error.data?.message || collected.error.message || 'Unknown error'}`);
+                            sendContentDelta(`[Proxy Error] ${collected.error.name || 'MiMoError'}: ${collected.error.data?.message || collected.error.message || 'Unknown error'}`);
                         }
 
-                        if (insideReasoning) {
-                            res.write(sseChunk(id, modelStr, { content: '\n</think>\n\n' }));
-                        }
-
-                        // Always re-parse tool calls from full text for accuracy
+                        // Parse tool calls from full text after collection completes
                         let parsedToolCalls = hasExternalTools
-                            ? parseExternalToolCallsFromText(externalToolRegistry, rawStreamedReasoning, rawStreamedContent)
+                            ? parseExternalToolCallsFromText(externalToolRegistry, rawReasoning, rawContent)
                             : [];
-
                         const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry, config);
+
                         if (validatedStreamedToolCalls.length > 0) {
                             const toolCallDeltas = validatedStreamedToolCalls.map((tc, index) => ({
                                 index, id: tc.id, type: 'function',
@@ -883,10 +792,12 @@ export function createApp(config) {
                         const totalTokens = promptTokens + completionTokens + reasoningTokens;
                         const finishReason = validatedStreamedToolCalls.length > 0 ? 'tool_calls' : 'stop';
                         res.write(sseChunk(id, modelStr, {}, finishReason));
-                        res.write(`data: ${JSON.stringify({
-                            id, choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                            usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens + reasoningTokens, total_tokens: totalTokens, completion_tokens_details: { reasoning_tokens: reasoningTokens } }
-                        })}\n\n`);
+                        res.write(sseUsageChunk(id, modelStr, finishReason, {
+                            prompt_tokens: promptTokens,
+                            completion_tokens: completionTokens + reasoningTokens,
+                            total_tokens: totalTokens,
+                            completion_tokens_details: { reasoning_tokens: reasoningTokens }
+                        }));
                         res.write('data: [DONE]\n\n');
                         res.end();
                     } else {
@@ -918,12 +829,7 @@ export function createApp(config) {
                         const reasoningTokensCalc = Math.ceil((safeReasoning || '').length / 4);
                         const totalTokens = promptTokens + completionTokensCalc + reasoningTokensCalc;
 
-                        // Don't mix reasoning into content — return pure content only.
-                        // Reasoning is sent via stream deltas (with thinking tags) in streaming mode.
-                        // Non-streaming returns clean content so title generation and other consumers
-                        // don't pick up reasoning text.
                         const finalContent = safeContent || '';
-
                         const publicToolCalls = toPublicToolCalls(validatedToolCalls);
                         const assistantMessage = publicToolCalls.length > 0
                             ? { role: 'assistant', content: finalContent || null, tool_calls: publicToolCalls }

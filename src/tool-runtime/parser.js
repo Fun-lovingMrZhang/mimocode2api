@@ -2,9 +2,9 @@ import { findExternalToolByName } from './registry.js';
 
 // ─── Flexible tag matching ───
 // Models may output <function_calls>, <function_call>, <tool_call>, <tool_use>, etc.
-// This regex matches any of these as opening/closing tags.
-const OPEN_TAG_RE = /<function_calls?>|<tool_calls?>|<tool_use[s]?>/;
-const CLOSE_TAG_RE = /<\/function_calls?>|<\/tool_calls?>|<\/tool_use[s]?>/;
+// Also <function=name> and <parameter=name> (self-closing XML style).
+const OPEN_TAG_RE = /<function_calls?>|<tool_calls?>|<tool_use[s]?>|<function(?:\s[^>]*)?>|<invoke\s+name=/;
+const CLOSE_TAG_RE = /<\/function_calls?>|<\/tool_calls?>|<\/tool_use[s]?>|<\/function>|<\/invoke>/;
 // Some models use <tool_name>...</tool_name><tool_arguments>...</tool_arguments>
 const TOOL_NAME_RE = /<tool_name>\s*([\s\S]*?)\s*<\/tool_name>/g;
 const TOOL_ARGS_RE = /<tool_arguments>\s*([\s\S]*?)\s*<\/tool_arguments>/g;
@@ -35,15 +35,26 @@ export function stripFunctionCallMarkup(text, trim = true) {
     cleaned = cleaned.replace(/<function_calls?>[\s\S]*?<\/function_calls?>/g, '');
     cleaned = cleaned.replace(/<tool_calls?>[\s\S]*?<\/tool_calls?>/g, '');
     cleaned = cleaned.replace(/<tool_use[s]?>[\s\S]*?<\/tool_use[s]?>/g, '');
+    // Remove <function=name>...</function> blocks
+    cleaned = cleaned.replace(/<function\s*=\s*[^>]+>[\s\S]*?<\/function>/g, '');
+    // Remove <invoke name="...">...</invoke> blocks
+    cleaned = cleaned.replace(/<invoke\s+name=[^>]+>[\s\S]*?<\/invoke>/g, '');
     // Remove loose tags
     cleaned = cleaned.replace(/<\/?function_calls?>/g, '');
     cleaned = cleaned.replace(/<\/?tool_calls?>/g, '');
     cleaned = cleaned.replace(/<\/?tool_use[s]?>/g, '');
+    cleaned = cleaned.replace(/<\/?function>/g, '');
+    cleaned = cleaned.replace(/<\/?function\s*=\s*[^>]*>/g, '');
+    cleaned = cleaned.replace(/<\/?invoke\s+name=[^>]*>/g, '');
     // Remove tool_name/tool_arguments pairs
     cleaned = cleaned.replace(/<tool_name>[\s\S]*?<\/tool_name>/g, '');
     cleaned = cleaned.replace(/<tool_arguments>[\s\S]*?<\/tool_arguments>/g, '');
-    // Remove invoke tags
-    cleaned = cleaned.replace(/<invoke\s+name=["'][^"']+["']\s*>[\s\S]*?<\/invoke>/g, '');
+    // Remove <parameter=name>...</parameter> leftovers
+    cleaned = cleaned.replace(/<parameter\s*=\s*[^>]+>[\s\S]*?<\/parameter>/g, '');
+    cleaned = cleaned.replace(/<\/?parameter\s*=\s*[^>]*>/g, '');
+    // Remove <arg name="...">...</arg> leftovers
+    cleaned = cleaned.replace(/<arg\s+name=[^>]+>[\s\S]*?<\/arg>/g, '');
+    cleaned = cleaned.replace(/<\/?arg\s+name=[^>]*>/g, '');
     return trim ? cleaned.trim() : cleaned;
 }
 
@@ -184,6 +195,44 @@ export function parseToolCallsFromText(...chunks) {
                 } catch {}
             }
         }
+
+        // Pattern 5: XML-style <function=name> ... </function> with <parameter=name>value</parameter>
+        if (matches.length === 0) {
+            const funcTagRegex = /<function\s*=\s*([^>\s]+)\s*>([\s\S]*?)<\/function>/g;
+            for (const fm of chunk.matchAll(funcTagRegex)) {
+                const name = fm[1].trim();
+                const body = fm[2];
+                const args = {};
+                const paramRegex = /<parameter\s*=\s*([^>\s]+)\s*>([\s\S]*?)<\/parameter>/g;
+                for (const pm of body.matchAll(paramRegex)) {
+                    args[pm[1].trim()] = pm[2].trim();
+                }
+                matches.push({
+                    id: `call_${Date.now()}_${matches.length + 1}`,
+                    type: 'function',
+                    function: { name, arguments: JSON.stringify(args) }
+                });
+            }
+        }
+
+        // Pattern 6: <invoke name="..."> with <arg name="...">value</arg>
+        if (matches.length === 0) {
+            const invokeRegex = /<invoke\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/invoke>/g;
+            for (const im of chunk.matchAll(invokeRegex)) {
+                const name = im[1].trim();
+                const body = im[2];
+                const args = {};
+                const argRegex = /<arg\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/arg>/g;
+                for (const am of body.matchAll(argRegex)) {
+                    args[am[1].trim()] = am[2].trim();
+                }
+                matches.push({
+                    id: `call_${Date.now()}_${matches.length + 1}`,
+                    type: 'function',
+                    function: { name, arguments: JSON.stringify(args) }
+                });
+            }
+        }
     });
     return matches;
 }
@@ -209,18 +258,30 @@ export function parseExternalToolCallsFromText(registry, ...chunks) {
 }
 
 // ─── Streaming filter: strip tool call markup from visible output ───
+// Stateful filter that handles tool-call XML tags split across stream deltas.
+// When a partial opening tag is detected at the end of a chunk (e.g. "<func"),
+// it is held back until the next chunk completes or refutes the tag.
+const PARTIAL_TAG_RE = /<\/?(?:func|tool|invoke|parameter|arg|function|tool_use)?[a-z_=]*$/i;
+
 export function createToolCallFilter({ disableTools, forceStrip = false }) {
     if (!disableTools && !forceStrip) return (chunk) => chunk;
     let inBlock = false;
+    let pending = ''; // buffered tail that might be a partial tag
     return (chunk) => {
         if (!chunk) return chunk;
+        // Prepend any pending partial tag from previous chunk
+        let remaining = pending + chunk;
+        pending = '';
         let output = '';
-        let remaining = chunk;
         while (remaining.length) {
             if (inBlock) {
                 const close = matchCloseTag(remaining, 0);
                 if (!close) {
-                    // Still inside block, discard
+                    // Still inside block — discard all, but check for partial close tag
+                    const partialClose = remaining.match(/<\/?[a-z_=]*$/i);
+                    if (partialClose) {
+                        pending = partialClose[0];
+                    }
                     return output;
                 }
                 remaining = remaining.slice(close.index + close.length);
@@ -229,12 +290,29 @@ export function createToolCallFilter({ disableTools, forceStrip = false }) {
             }
             const open = matchOpenTag(remaining);
             if (!open) {
-                // Also check for tool_name/tool_arguments bare tags
+                // Check for bare tool_name/tool_arguments tags
                 const tnIdx = remaining.indexOf('<tool_name>');
                 const tiIdx = remaining.indexOf('<tool_arguments>');
-                if (tnIdx === -1 && tiIdx === -1) {
+                // Also check for stray closing tags (model output bug)
+                const closeMatch = remaining.match(/<\/(?:function_calls?|tool_calls?|tool_use[s]?|function|invoke)>/);
+                if (tnIdx === -1 && tiIdx === -1 && !closeMatch) {
+                    // No opening tag found — but check if the tail looks like a partial tag
+                    const partial = remaining.match(PARTIAL_TAG_RE);
+                    if (partial) {
+                        // Hold back the partial tag for next chunk
+                        output += remaining.slice(0, remaining.length - partial[0].length);
+                        pending = partial[0];
+                        return output;
+                    }
                     output += remaining;
                     return output;
+                }
+                // Handle stray closing tags
+                if (closeMatch && tnIdx === -1 && tiIdx === -1) {
+                    const cutIdx = closeMatch.index;
+                    output += remaining.slice(0, cutIdx);
+                    remaining = remaining.slice(cutIdx + closeMatch[0].length);
+                    continue;
                 }
                 const cutIdx = tnIdx !== -1 ? (tiIdx !== -1 ? Math.min(tnIdx, tiIdx) : tnIdx) : tiIdx;
                 output += remaining.slice(0, cutIdx);
@@ -245,6 +323,14 @@ export function createToolCallFilter({ disableTools, forceStrip = false }) {
             output += remaining.slice(0, open.index);
             remaining = remaining.slice(open.index + open.length);
             inBlock = true;
+        }
+        // After processing, check if we ended on a partial tag while not in block
+        if (!inBlock) {
+            const partial = output.match(PARTIAL_TAG_RE);
+            if (partial) {
+                pending = partial[0];
+                output = output.slice(0, output.length - partial[0].length);
+            }
         }
         return output;
     };
