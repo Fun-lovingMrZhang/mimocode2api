@@ -214,14 +214,19 @@ export function parseToolCallsFromText(...chunks) {
         }
 
         // Pattern 2: Bare <tool_name>...</tool_name><tool_arguments>...</tool_arguments>
-        // Also handles <parameters> as a variant of <tool_arguments>
+        // Also handles <parameters>, <tool_input>, and bare <param name="..."> as argument containers
         const nameMatches = [...chunk.matchAll(TOOL_NAME_RE)];
         nameMatches.forEach((nm, index) => {
             const name = nm[1].trim();
-            // Find corresponding arguments: try <tool_arguments> first, then <parameters>
+            // Find corresponding arguments: try <tool_arguments>, <parameters>, <tool_input> in order
             const afterName = chunk.slice(nm.index + nm[0].length);
             let argsMatch = afterName.match(TOOL_ARGS_SINGLE);
             if (!argsMatch) argsMatch = afterName.match(PARAMETERS_SINGLE);
+            if (!argsMatch) {
+                // <tool_input> as argument container — content may be JSON or XML tags
+                const tiMatch = afterName.match(/<tool_input>\s*([\s\S]*?)\s*<\/tool_input>/);
+                if (tiMatch) argsMatch = tiMatch;
+            }
             let args = '{}';
             if (argsMatch) {
                 const rawArgs = argsMatch[1].trim();
@@ -244,6 +249,14 @@ export function parseToolCallsFromText(...chunks) {
                     });
                     args = Object.keys(argObj).length > 0 ? JSON.stringify(argObj) : rawArgs;
                 }
+            } else {
+                // No argument container found — try bare <param name="..."> tags right after tool_name
+                const bareParams = [...afterName.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)];
+                if (bareParams.length > 0) {
+                    const argObj = {};
+                    bareParams.forEach((am) => { argObj[am[1]] = am[2].trim(); });
+                    args = JSON.stringify(argObj);
+                }
             }
             matches.push({
                 id: `call_${Date.now()}_${matches.length + index + 1}`,
@@ -257,10 +270,14 @@ export function parseToolCallsFromText(...chunks) {
         const funcNameMatches = [...chunk.matchAll(FUNC_NAME_RE)];
         funcNameMatches.forEach((nm, index) => {
             const name = nm[1].trim();
-            // Find corresponding arguments: try <tool_arguments> first, then <parameters>
+            // Find corresponding arguments: try <tool_arguments>, <parameters>, <tool_input> in order
             const afterName = chunk.slice(nm.index + nm[0].length);
             let argsMatch = afterName.match(TOOL_ARGS_SINGLE);
             if (!argsMatch) argsMatch = afterName.match(PARAMETERS_SINGLE);
+            if (!argsMatch) {
+                const tiMatch = afterName.match(/<tool_input>\s*([\s\S]*?)\s*<\/tool_input>/);
+                if (tiMatch) argsMatch = tiMatch;
+            }
             let args = '{}';
             if (argsMatch) {
                 const rawArgs = argsMatch[1].trim();
@@ -279,6 +296,14 @@ export function parseToolCallsFromText(...chunks) {
                         argObj[am[1]] = am[2].trim();
                     });
                     args = Object.keys(argObj).length > 0 ? JSON.stringify(argObj) : rawArgs;
+                }
+            } else {
+                // No argument container found — try bare <param name="..."> tags right after function_name
+                const bareParams = [...afterName.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)];
+                if (bareParams.length > 0) {
+                    const argObj = {};
+                    bareParams.forEach((am) => { argObj[am[1]] = am[2].trim(); });
+                    args = JSON.stringify(argObj);
                 }
             }
             matches.push({
