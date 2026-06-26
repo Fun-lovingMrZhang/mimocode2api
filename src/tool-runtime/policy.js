@@ -51,19 +51,27 @@ export function evaluateToolPolicy(tool, args, context = {}) {
   }
 
   if (!inAllowlist && (tool.sideEffect === TOOL_SIDE_EFFECTS.DELETE || tool.riskLevel === TOOL_RISK_LEVELS.CRITICAL)) {
-    return {
-      status: TOOL_POLICY_DECISIONS.REQUIRE_CONFIRMATION,
-      reason: `Tool ${tool.originalName} is high risk and requires confirmation.`,
-      confirmationPayload: {
-        toolName: tool.originalName,
-        namespacedName: tool.namespacedName,
-        argumentsPreview: args,
-        risk: tool.riskLevel
-      }
-    };
+    // In a proxy context, there is no interactive confirmation channel.
+    // Hermes has its own approval system — allow these through and let
+    // Hermes handle confirmation. Only block if explicitly in denylist.
+    if (policy.mode === 'enforce' && policy.confirmationRequired.has(tool.originalName)) {
+      return {
+        status: TOOL_POLICY_DECISIONS.REQUIRE_CONFIRMATION,
+        reason: `Tool ${tool.originalName} is high risk and requires confirmation.`,
+        confirmationPayload: {
+          toolName: tool.originalName,
+          namespacedName: tool.namespacedName,
+          argumentsPreview: args,
+          risk: tool.riskLevel
+        }
+      };
+    }
   }
 
-  if (requiresConfirmation && policy.mode !== 'report-only') {
+  // requiresConfirmation from tool inference (WRITE side-effect) should NOT
+  // block in proxy mode — Hermes handles its own approvals. Only block if
+  // the tool was explicitly added to the confirmation required set by config.
+  if (requiresConfirmation && policy.mode === 'enforce' && policy.confirmationRequired.has(tool.originalName)) {
     return {
       status: TOOL_POLICY_DECISIONS.REQUIRE_CONFIRMATION,
       reason: `Tool ${tool.originalName} requires confirmation before execution.`,
