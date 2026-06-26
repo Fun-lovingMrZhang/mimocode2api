@@ -70,6 +70,11 @@ export function stripFunctionCallMarkup(text, trim = true) {
     // Remove <arg name="...">...</arg> leftovers
     cleaned = cleaned.replace(/<arg\s+name=[^>]+>[\s\S]*?<\/arg>/g, '');
     cleaned = cleaned.replace(/<\/?arg\s+name=[^>]*>/g, '');
+    // Remove <param_name>/<param_value> leftovers
+    cleaned = cleaned.replace(/<param_name>[\s\S]*?<\/param_name>/g, '');
+    cleaned = cleaned.replace(/<param_value>[\s\S]*?<\/param_value>/g, '');
+    cleaned = cleaned.replace(/<\/?param_name>/g, '');
+    cleaned = cleaned.replace(/<\/?param_value>/g, '');
     return trim ? cleaned.trim() : cleaned;
 }
 
@@ -247,15 +252,34 @@ export function parseToolCallsFromText(...chunks) {
                     [...rawArgs.matchAll(/<arg\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/arg>/g)].forEach((am) => {
                         argObj[am[1]] = am[2].trim();
                     });
+                    // Format 4: <param_name>key</param_name><param_value>val</param_value>
+                    const paramNames = [...rawArgs.matchAll(/<param_name>\s*([\s\S]*?)\s*<\/param_name>/g)];
+                    const paramValues = [...rawArgs.matchAll(/<param_value>\s*([\s\S]*?)\s*<\/param_value>/g)];
+                    paramNames.forEach((pn, i) => {
+                        if (paramValues[i]) {
+                            argObj[pn[1].trim()] = paramValues[i][1].trim();
+                        }
+                    });
                     args = Object.keys(argObj).length > 0 ? JSON.stringify(argObj) : rawArgs;
                 }
             } else {
-                // No argument container found — try bare <param name="..."> tags right after tool_name
+                // No argument container found — try bare param formats right after tool_name
                 const bareParams = [...afterName.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)];
                 if (bareParams.length > 0) {
                     const argObj = {};
                     bareParams.forEach((am) => { argObj[am[1]] = am[2].trim(); });
                     args = JSON.stringify(argObj);
+                } else {
+                    // Try <param_name>key</param_name><param_value>val</param_value> format
+                    const pNames = [...afterName.matchAll(/<param_name>\s*([\s\S]*?)\s*<\/param_name>/g)];
+                    const pValues = [...afterName.matchAll(/<param_value>\s*([\s\S]*?)\s*<\/param_value>/g)];
+                    if (pNames.length > 0 && pValues.length > 0) {
+                        const argObj = {};
+                        pNames.forEach((pn, i) => {
+                            if (pValues[i]) argObj[pn[1].trim()] = pValues[i][1].trim();
+                        });
+                        args = JSON.stringify(argObj);
+                    }
                 }
             }
             matches.push({
