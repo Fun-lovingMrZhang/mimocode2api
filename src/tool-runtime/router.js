@@ -36,25 +36,27 @@ export function buildExternalToolsPrompt(registry, toolChoice = null) {
     choiceInstructions.push('Tool use is disabled for this turn. Do not emit <function_calls>.');
   }
 
+  // Build a concise example from the first tool to make the format concrete.
+  const firstTool = registry[0];
+  const exampleName = firstTool?.namespacedName || 'external__tool';
+  const exampleArgs = firstTool?.parameters?.properties
+    ? Object.entries(firstTool.parameters.properties).slice(0, 1).map(([k]) => `"${k}":"value"`).join(',')
+    : '';
+
   return [
-    'External tools are virtualized by this proxy. They are not OpenCode tools.',
-    'When you need to call an external tool, output ONLY one or more <function_calls>...</function_calls> blocks.',
-    'Do NOT wrap tool calls in JSON objects or any other format. Use ONLY <function_calls> XML blocks.',
-    'Each block must contain a JSON array with this exact shape:',
-    '[{"name":"external__tool_name","arguments":{}}]',
-    'Arguments must be a valid JSON object that matches the declared schema.',
-    'Use only the namespaced names listed below. Do not use original client tool names inside function calls.',
-    'If tool results are later provided as TOOL_RESULT messages, use those results to continue normally.',
-    'You may include brief reasoning text before <function_calls> blocks to explain your intent.',
+    'You have access to external tools. To call a tool, output a <function_calls> block in your reply.',
+    'The block must contain a JSON array. Example:',
+    `<function_calls>[{"name":"${exampleName}","arguments":{${exampleArgs}}}]</function_calls>`,
+    'Rules:',
+    '- Output the <function_calls> block directly in your text reply (not in reasoning).',
+    '- Use the exact tool names and parameter names from the list below.',
+    '- You may write a brief explanation before the block.',
+    '- After the tool result is provided as TOOL_RESULT, continue the conversation normally.',
     ...choiceInstructions,
-    `Available external tools: ${JSON.stringify(registry.map((tool) => ({
+    `Available tools: ${JSON.stringify(registry.map((tool) => ({
       name: tool.namespacedName,
-      client_name: tool.originalName,
       description: tool.description,
-      parameters: tool.parameters,
-      risk_level: tool.riskLevel,
-      side_effect: tool.sideEffect,
-      requires_confirmation: tool.requiresConfirmation
+      parameters: tool.parameters
     })))}`
   ].join('\n');
 }
