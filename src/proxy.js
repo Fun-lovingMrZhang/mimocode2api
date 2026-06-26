@@ -331,8 +331,7 @@ async function buildPromptParts(rawMessages, externalToolRegistry = []) {
 }
 
 function buildSystemPrompt(config, baseSystem, reasoningEffort, toolMode, _externalToolPrompt) {
-    // Fully pass-through: do not inject any tool prompt.
-    // Hermes owns the system prompt and describes tool format itself.
+    // Fully pass-through: Hermes owns the system prompt and describes tool format itself.
     const chunks = [];
     if (baseSystem) chunks.push(baseSystem);
     if (toolMode === 'disabled' && config.DISABLE_TOOLS) chunks.push(TOOL_GUARD_MESSAGE);
@@ -412,9 +411,17 @@ async function pollForAssistantResponse(client, config, sessionId, timeoutMs, in
                 if (info?.role !== 'assistant') continue;
                 const { content, reasoning } = extractFromParts(entry?.parts || []);
                 const error = info?.error || null;
+                // MiMo's info.finish is a per-step signal that may fire before all
+                // content parts have been fully generated. Only treat it as done
+                // when content is also non-empty. If we see finish=true but content
+                // is empty, keep polling — the content will arrive in subsequent polls.
                 const done = Boolean(info.finish || info.time?.completed || error);
-                if (done || content) {
-                    if (error) console.error('[Proxy] MiMo assistant error:', error);
+                if (error) {
+                    console.error('[Proxy] MiMo assistant error:', error);
+                    logDebug(config, 'Polling completed (error)', { sessionId, ms: Date.now() - pollStart, contentLen: content.length, reasoningLen: reasoning.length });
+                    return { content, reasoning, error };
+                }
+                if (done && content) {
                     logDebug(config, 'Polling completed', { sessionId, ms: Date.now() - pollStart, done, contentLen: content.length, reasoningLen: reasoning.length });
                     return { content, reasoning, error };
                 }
@@ -636,16 +643,33 @@ export function createApp(config) {
                         };
                         ensureKeepalive();
 
-                        // Buffer-based tool call markup filter for content deltas.
-                        // When external tools are active, the model may emit <function_calls>...</function_calls>
-                        // blocks mixed into its text output. We must strip these from the visible content
-                        // stream and only deliver them as structured tool_calls deltas at the end.
-                        // Also strip thinking-face markers (🤔 U+1F914) that the backend may insert
-                        // at reasoning/text boundaries.
+                        // Content strategy when external tools are active:
+                        // Buffer ALL content deltas instead of streaming them immediately.
+                        // After SSE completes, check if tool calls were emitted:
+                        //   - If yes: suppress all buffered content (it's pre-tool-call chatter)
+                        //   - If no: flush the buffered content as a single delta
+                        // This prevents "Let me search for..." text from leaking to the user
+                        // before the tool call is parsed and returned.
+                        //
+                        // When no external tools: stream content immediately (original behavior).
                         const THINKING_MARKER = /\u{1F914}/gu;
                         const contentFilter = hasExternalTools
                             ? createToolCallFilter({ disableTools: false, forceStrip: true })
                             : null;
+
+                        let contentBuffer = '';
+                        let contentFlushed = false;
+
+                        const flushContentBuffer = () => {
+                            if (contentFlushed || !contentBuffer) return;
+                            contentFlushed = true;
+                            const filtered = contentFilter ? contentFilter(contentBuffer) : contentBuffer;
+                            if (filtered) {
+                                completionTokens += Math.ceil(filtered.length / 4);
+                                res.write(sseChunk(id, modelStr, { content: filtered }));
+                            }
+                            contentBuffer = '';
+                        };
 
                         const sendContentDelta = (delta) => {
                             if (!delta) return;
@@ -653,10 +677,13 @@ export function createApp(config) {
                             let cleaned = delta.replace(THINKING_MARKER, '');
                             if (!cleaned) return;
                             rawContent += cleaned;
-                            const filtered = contentFilter ? contentFilter(cleaned) : cleaned;
-                            if (filtered) {
-                                completionTokens += Math.ceil(filtered.length / 4);
-                                res.write(sseChunk(id, modelStr, { content: filtered }));
+                            if (hasExternalTools) {
+                                // Buffer mode: accumulate, don't stream yet
+                                contentBuffer += cleaned;
+                            } else {
+                                // Direct mode: stream immediately
+                                completionTokens += Math.ceil(cleaned.length / 4);
+                                res.write(sseChunk(id, modelStr, { content: cleaned }));
                             }
                         };
 
@@ -780,11 +807,16 @@ export function createApp(config) {
                         const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry, config);
 
                         if (validatedStreamedToolCalls.length > 0) {
+                            // Tool calls found — suppress buffered content (pre-tool-call chatter)
+                            // by NOT calling flushContentBuffer. The contentBuffer is discarded.
                             const toolCallDeltas = validatedStreamedToolCalls.map((tc, index) => ({
                                 index, id: tc.id, type: 'function',
                                 function: { name: tc.function.name, arguments: tc.function.arguments }
                             }));
                             res.write(sseChunk(id, modelStr, { tool_calls: toolCallDeltas }));
+                        } else if (hasExternalTools) {
+                            // No tool calls — flush buffered content to the client
+                            flushContentBuffer();
                         }
 
                         if (keepaliveInterval) clearInterval(keepaliveInterval);
@@ -822,15 +854,18 @@ export function createApp(config) {
                             : [];
                         const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry, config);
 
-                        const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
-                        const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
+                        const safeContent = stripFunctionCallMarkup(content);
+                        const safeReasoning = stripFunctionCallMarkup(reasoning);
+
+                        // When tool calls are present, suppress pre-tool-call chatter
+                        // (same logic as streaming mode's content buffering)
+                        const finalContent = validatedToolCalls.length > 0 ? '' : (safeContent || '');
 
                         const promptTokens = Math.ceil((fullPromptText || '').length / 4);
                         const completionTokensCalc = Math.ceil((safeContent || '').length / 4);
                         const reasoningTokensCalc = Math.ceil((safeReasoning || '').length / 4);
                         const totalTokens = promptTokens + completionTokensCalc + reasoningTokensCalc;
 
-                        const finalContent = safeContent || '';
                         const publicToolCalls = toPublicToolCalls(validatedToolCalls);
                         const assistantMessage = publicToolCalls.length > 0
                             ? { role: 'assistant', content: finalContent || null, tool_calls: publicToolCalls }

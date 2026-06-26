@@ -39,27 +39,48 @@ function validateAgainstSchema(args, schema = {}) {
   });
 
   Object.entries(properties).forEach(([key, definition]) => {
-    if (!(key in args) || args[key] === undefined || args[key] === null) return;
-    const value = args[key];
-    const expectedType = definition?.type;
-    if (expectedType === 'string' && typeof value !== 'string') {
-      errors.push(createValidationError('invalid_type', `Field ${key} must be a string`, [key]));
-    }
-    if (expectedType === 'number' && typeof value !== 'number') {
-      errors.push(createValidationError('invalid_type', `Field ${key} must be a number`, [key]));
-    }
-    if (expectedType === 'integer' && !Number.isInteger(value)) {
-      errors.push(createValidationError('invalid_type', `Field ${key} must be an integer`, [key]));
-    }
-    if (expectedType === 'boolean' && typeof value !== 'boolean') {
-      errors.push(createValidationError('invalid_type', `Field ${key} must be a boolean`, [key]));
-    }
-    if (expectedType === 'object' && (!value || typeof value !== 'object' || Array.isArray(value))) {
-      errors.push(createValidationError('invalid_type', `Field ${key} must be an object`, [key]));
-    }
-    if (Array.isArray(definition?.enum) && !definition.enum.includes(value)) {
-      errors.push(createValidationError('invalid_enum', `Field ${key} must be one of: ${definition.enum.join(', ')}`, [key]));
-    }
+      if (!(key in args) || args[key] === undefined || args[key] === null) return;
+      const value = args[key];
+      const expectedType = definition?.type;
+
+      // Auto-coercion: models frequently emit numbers and booleans as strings.
+      // Repair in-place so downstream code receives the correct JS type.
+      if (expectedType === 'integer' && typeof value === 'string') {
+          const parsed = Number(value);
+          if (Number.isInteger(parsed)) { args[key] = parsed; }
+          else { errors.push(createValidationError('invalid_type', `Field ${key} must be an integer`, [key])); return; }
+      }
+      if (expectedType === 'number' && typeof value === 'string') {
+          const parsed = Number(value);
+          if (!Number.isNaN(parsed)) { args[key] = parsed; }
+          else { errors.push(createValidationError('invalid_type', `Field ${key} must be a number`, [key])); return; }
+      }
+      if (expectedType === 'boolean' && typeof value === 'string') {
+          const lower = value.toLowerCase();
+          if (lower === 'true' || lower === '1') { args[key] = true; }
+          else if (lower === 'false' || lower === '0') { args[key] = false; }
+          else { errors.push(createValidationError('invalid_type', `Field ${key} must be a boolean`, [key])); return; }
+      }
+
+      const coercedValue = args[key];
+      if (expectedType === 'string' && typeof coercedValue !== 'string') {
+          errors.push(createValidationError('invalid_type', `Field ${key} must be a string`, [key]));
+      }
+      if (expectedType === 'number' && typeof coercedValue !== 'number') {
+          errors.push(createValidationError('invalid_type', `Field ${key} must be a number`, [key]));
+      }
+      if (expectedType === 'integer' && !Number.isInteger(coercedValue)) {
+          errors.push(createValidationError('invalid_type', `Field ${key} must be an integer`, [key]));
+      }
+      if (expectedType === 'boolean' && typeof coercedValue !== 'boolean') {
+          errors.push(createValidationError('invalid_type', `Field ${key} must be a boolean`, [key]));
+      }
+      if (expectedType === 'object' && (!coercedValue || typeof coercedValue !== 'object' || Array.isArray(coercedValue))) {
+          errors.push(createValidationError('invalid_type', `Field ${key} must be an object`, [key]));
+      }
+      if (Array.isArray(definition?.enum) && !definition.enum.includes(coercedValue)) {
+          errors.push(createValidationError('invalid_enum', `Field ${key} must be one of: ${definition.enum.join(', ')}`, [key]));
+      }
   });
 
   return errors;
