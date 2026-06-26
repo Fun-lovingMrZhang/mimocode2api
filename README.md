@@ -86,8 +86,21 @@ Client (OpenAI API format)
 - **Streaming support** — SSE with fallback to polling
 - **Multi-turn conversations** — full message history support
 - **Image support** — multimodal image input via data URI
-- **Reasoning output** — `<think>` blocks for reasoning models
+- **Reasoning output** — `reasoning_content` field for reasoning models
+- **Tool calling** — external tool bridge via `<function_calls>` XML format
+- **Pass-through system prompt** — client owns the system prompt; proxy does not inject tool instructions
 - **Docker-ready** — one command deployment
+
+## Tool Calling
+
+The proxy supports external tool calling via a virtualized bridge. Backend (MiMoCode) tools are disabled; tools defined by the client (e.g. Hermes Agent) are exposed to the model through the client's own system prompt. The model outputs tool calls as `<function_calls>` XML blocks, which the proxy parses and converts to OpenAI `tool_calls` format.
+
+### Known Limitations
+
+- **Single-parameter tools work reliably** (~80% success rate). Examples: `terminal(command)`, `read_file(path)`, `web_search(query)`.
+- **Multi-parameter tools are unreliable** (~0% success rate). The MiMo model often reasons about the tool call but fails to emit the `<function_calls>` block when multiple required parameters are involved. Examples: `write_file(path, content)`, `patch(path, old_string, new_string)`.
+- **File write/patch operations** are not reliably supported. Use `terminal` with shell commands (`echo > file`, `sed -i`) as a workaround.
+- When a tool call is not emitted, the client receives an empty response and may retry. The retry mechanism compensates for most single-parameter cases.
 
 ## Disclaimer
 

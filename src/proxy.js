@@ -330,10 +330,11 @@ async function buildPromptParts(rawMessages, externalToolRegistry = []) {
     };
 }
 
-function buildSystemPrompt(config, baseSystem, reasoningEffort, toolMode, externalToolPrompt) {
+function buildSystemPrompt(config, baseSystem, reasoningEffort, toolMode, _externalToolPrompt) {
+    // Fully pass-through: do not inject any tool prompt.
+    // Hermes owns the system prompt and describes tool format itself.
     const chunks = [];
     if (baseSystem) chunks.push(baseSystem);
-    if (externalToolPrompt) chunks.push(externalToolPrompt);
     if (toolMode === 'disabled' && config.DISABLE_TOOLS) chunks.push(TOOL_GUARD_MESSAGE);
     if (reasoningEffort && reasoningEffort !== 'none') chunks.push(`Reasoning effort: ${reasoningEffort}`);
     return chunks.join('\n\n');
