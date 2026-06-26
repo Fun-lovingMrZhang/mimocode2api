@@ -3,8 +3,8 @@ import { findExternalToolByName } from './registry.js';
 // ─── Flexible tag matching ───
 // Models may output <function_calls>, <function_call>, <tool_call>, <tool_use>, etc.
 // Also <function=name> and <parameter=name> (self-closing XML style).
-const OPEN_TAG_RE = /<function_calls?>|<tool_calls?>|<tool_use[s]?>|<function(?:\s[^>]*)?>|<invoke\s+name=/;
-const CLOSE_TAG_RE = /<\/function_calls?>|<\/tool_calls?>|<\/tool_use[s]?>|<\/function>|<\/invoke>/;
+const OPEN_TAG_RE = /<function_calls?>|<tool_calls?>|<tool_use[s]?>|<function(?:\s[^>]*)?>|<function_call\s+name=|<invoke\s+name=|<tool_name>/;
+const CLOSE_TAG_RE = /<\/function_calls?>|<\/tool_calls?>|<\/tool_use[s]?>|<\/function>|<\/invoke>|<\/tool_name>|<\/parameters>|\/>/;
 // Some models use <tool_name>...</tool_name><tool_arguments>...</tool_arguments>
 const TOOL_NAME_RE = /<tool_name>\s*([\s\S]*?)\s*<\/tool_name>/g;
 const TOOL_ARGS_RE = /<tool_arguments>\s*([\s\S]*?)\s*<\/tool_arguments>/g;
@@ -39,6 +39,10 @@ export function stripFunctionCallMarkup(text, trim = true) {
     cleaned = cleaned.replace(/<function\s*=\s*[^>]+>[\s\S]*?<\/function>/g, '');
     // Remove <invoke name="...">...</invoke> blocks
     cleaned = cleaned.replace(/<invoke\s+name=[^>]+>[\s\S]*?<\/invoke>/g, '');
+    // Remove <function_call name="..." arguments=... /> self-closing tags
+    cleaned = cleaned.replace(/<function_call\s+name\s*=\s*["'][^"']+["']\s+arguments\s*=\s*.+?\/?>/g, '');
+    // Remove <parameters>...</parameters> blocks
+    cleaned = cleaned.replace(/<parameters>[\s\S]*?<\/parameters>/g, '');
     // Remove loose tags
     cleaned = cleaned.replace(/<\/?function_calls?>/g, '');
     cleaned = cleaned.replace(/<\/?tool_calls?>/g, '');
@@ -59,6 +63,13 @@ export function stripFunctionCallMarkup(text, trim = true) {
 }
 
 // ─── Parse raw tool calls from text (flexible format) ───
+// Additional regex for <function_call name="..." arguments={json} /> self-closing format
+// Uses a greedy match for arguments, stopping at the LAST /> or > on the line
+const FUNC_CALL_ATTR_RE = /<function_call\s+name\s*=\s*["']([^"']+)["']\s+arguments\s*=\s*(.+?)\s*\/>\s*$/gm;
+// <parameters>{json}</parameters> — model variant of <tool_arguments>
+const PARAMETERS_RE = /<parameters>\s*([\s\S]*?)\s*<\/parameters>/g;
+const PARAMETERS_SINGLE = /<parameters>\s*([\s\S]*?)\s*<\/parameters>/;
+
 function extractCallsFromBlock(content) {
     const calls = [];
 
@@ -81,31 +92,83 @@ function extractCallsFromBlock(content) {
             }
         });
     } catch {
-        // Not valid JSON — try tool_name/tool_arguments format
+        // Not valid JSON — try structured XML formats
+
+        // <function_call name="..." arguments={json} /> self-closing format
+        for (const fm of content.matchAll(FUNC_CALL_ATTR_RE)) {
+            const name = fm[1].trim();
+            const rawArgs = fm[2].trim();
+            let args = '{}';
+            // arguments might be a JSON object, a JSON string, or malformed
+            try {
+                const parsed = JSON.parse(rawArgs);
+                args = typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
+            } catch {
+                // Try extracting just the JSON object part
+                const jsonMatch = rawArgs.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                    try {
+                        const parsed = JSON.parse(jsonMatch[0]);
+                        args = JSON.stringify(parsed);
+                    } catch {
+                        args = jsonMatch[0];
+                    }
+                } else {
+                    args = rawArgs;
+                }
+            }
+            if (name) calls.push({ name, arguments: args });
+        }
+
+        // <tool_name>...</tool_name> with <tool_arguments> OR <parameters>
         const nameMatch = content.match(TOOL_NAME_SINGLE);
-        const argsMatch = content.match(TOOL_ARGS_SINGLE);
         if (nameMatch) {
             const name = nameMatch[1].trim();
             let args = '{}';
+            // Try <tool_arguments> first, then <parameters> as fallback
+            let argsMatch = content.match(TOOL_ARGS_SINGLE);
+            if (!argsMatch) argsMatch = content.match(PARAMETERS_SINGLE);
             if (argsMatch) {
+                const rawArgs = argsMatch[1].trim();
                 try {
-                    const parsedArgs = JSON.parse(argsMatch[1].trim());
-                    args = JSON.stringify(parsedArgs);
+                    args = JSON.stringify(JSON.parse(rawArgs));
                 } catch {
-                    args = argsMatch[1].trim();
+                    // Not JSON — try XML tag format: <param_name>value</param_name>
+                    const xmlArgMatches = [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)];
+                    if (xmlArgMatches.length > 0) {
+                        const argObj = {};
+                        xmlArgMatches.forEach((am) => {
+                            argObj[am[1]] = am[2].trim();
+                        });
+                        args = JSON.stringify(argObj);
+                    } else {
+                        args = rawArgs;
+                    }
                 }
             }
             calls.push({ name, arguments: args });
         }
 
-        // Try <invoke name="..."> format
+        // <invoke name="..."> format — with proper <arg> tag handling
         const invokeMatch = content.match(INVOKE_SINGLE);
         if (invokeMatch) {
             const name = invokeMatch[1].trim();
+            const body = invokeMatch[2] || '';
             let args = '{}';
+            // First try JSON.parse (for <invoke name="...">{json}</invoke> format)
             try {
-                args = JSON.stringify(JSON.parse(invokeMatch[2].trim()));
-            } catch {}
+                args = JSON.stringify(JSON.parse(body.trim()));
+            } catch {
+                // JSON parse failed — check for <arg name="...">value</arg> tags
+                const argMatches = [...body.matchAll(/<arg\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/arg>/g)];
+                if (argMatches.length > 0) {
+                    const argObj = {};
+                    argMatches.forEach((am) => {
+                        argObj[am[1].trim()] = am[2].trim();
+                    });
+                    args = JSON.stringify(argObj);
+                }
+            }
             calls.push({ name, arguments: args });
         }
     }
@@ -139,18 +202,31 @@ export function parseToolCallsFromText(...chunks) {
         }
 
         // Pattern 2: Bare <tool_name>...</tool_name><tool_arguments>...</tool_arguments>
+        // Also handles <parameters> as a variant of <tool_arguments>
         const nameMatches = [...chunk.matchAll(TOOL_NAME_RE)];
         nameMatches.forEach((nm, index) => {
             const name = nm[1].trim();
-            // Find corresponding arguments (next tool_arguments block after this tool_name)
+            // Find corresponding arguments: try <tool_arguments> first, then <parameters>
             const afterName = chunk.slice(nm.index + nm[0].length);
-            const argsMatch = afterName.match(TOOL_ARGS_RE);
+            let argsMatch = afterName.match(TOOL_ARGS_SINGLE);
+            if (!argsMatch) argsMatch = afterName.match(PARAMETERS_SINGLE);
             let args = '{}';
             if (argsMatch) {
+                const rawArgs = argsMatch[1].trim();
                 try {
-                    args = JSON.stringify(JSON.parse(argsMatch[1].trim()));
+                    args = JSON.stringify(JSON.parse(rawArgs));
                 } catch {
-                    args = argsMatch[1].trim();
+                    // Not JSON — try XML tag format: <param_name>value</param_name>
+                    const xmlArgMatches = [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)];
+                    if (xmlArgMatches.length > 0) {
+                        const argObj = {};
+                        xmlArgMatches.forEach((am) => {
+                            argObj[am[1]] = am[2].trim();
+                        });
+                        args = JSON.stringify(argObj);
+                    } else {
+                        args = rawArgs;
+                    }
                 }
             }
             matches.push({
@@ -160,18 +236,58 @@ export function parseToolCallsFromText(...chunks) {
             });
         });
 
-        // Pattern 3: <invoke name="...">...</invoke>
+        // Pattern 3: <invoke name="...">...</invoke> with <arg> or JSON body
         for (const invoke of chunk.matchAll(INVOKE_RE)) {
             const name = invoke[1].trim();
+            const body = invoke[2] || '';
             let args = '{}';
+            // Try JSON first, then <arg> tags
             try {
-                args = JSON.stringify(JSON.parse(invoke[2].trim()));
-            } catch {}
+                args = JSON.stringify(JSON.parse(body.trim()));
+            } catch {
+                const argMatches = [...body.matchAll(/<arg\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/arg>/g)];
+                if (argMatches.length > 0) {
+                    const argObj = {};
+                    argMatches.forEach((am) => {
+                        argObj[am[1].trim()] = am[2].trim();
+                    });
+                    args = JSON.stringify(argObj);
+                }
+            }
             matches.push({
                 id: `call_${Date.now()}_${matches.length + 1}`,
                 type: 'function',
                 function: { name, arguments: args }
             });
+        }
+
+        // Pattern 3c: <function_call name="..." arguments={json} /> self-closing
+        if (matches.length === 0) {
+            for (const fm of chunk.matchAll(FUNC_CALL_ATTR_RE)) {
+                const name = fm[1].trim();
+                const rawArgs = fm[2].trim();
+                let args = '{}';
+                try {
+                    const parsed = JSON.parse(rawArgs);
+                    args = typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
+                } catch {
+                    const jsonMatch = rawArgs.match(/\{[\s\S]*\}/);
+                    if (jsonMatch) {
+                        try {
+                            args = JSON.stringify(JSON.parse(jsonMatch[0]));
+                        } catch {
+                            args = jsonMatch[0];
+                        }
+                    } else {
+                        args = rawArgs;
+                    }
+                }
+                matches.push({
+                    id: `call_${Date.now()}_${matches.length + 1}`,
+                    type: 'function',
+                    function: { name, arguments: args }
+                });
+            }
         }
 
         // Pattern 4: Bare JSON (no XML tags) — {"name":"external__tool","arguments":{...}}
@@ -261,7 +377,7 @@ export function parseExternalToolCallsFromText(registry, ...chunks) {
 // Stateful filter that handles tool-call XML tags split across stream deltas.
 // When a partial opening tag is detected at the end of a chunk (e.g. "<func"),
 // it is held back until the next chunk completes or refutes the tag.
-const PARTIAL_TAG_RE = /<\/?(?:func|tool|invoke|parameter|arg|function|tool_use)?[a-z_=]*$/i;
+const PARTIAL_TAG_RE = /<\/?(?:func|tool|invoke|parameter|arg|function|tool_use|parameters)?[a-z_=]*$/i;
 
 export function createToolCallFilter({ disableTools, forceStrip = false }) {
     if (!disableTools && !forceStrip) return (chunk) => chunk;
@@ -293,9 +409,10 @@ export function createToolCallFilter({ disableTools, forceStrip = false }) {
                 // Check for bare tool_name/tool_arguments tags
                 const tnIdx = remaining.indexOf('<tool_name>');
                 const tiIdx = remaining.indexOf('<tool_arguments>');
+                const piIdx = remaining.indexOf('<parameters>');
                 // Also check for stray closing tags (model output bug)
-                const closeMatch = remaining.match(/<\/(?:function_calls?|tool_calls?|tool_use[s]?|function|invoke)>/);
-                if (tnIdx === -1 && tiIdx === -1 && !closeMatch) {
+                const closeMatch = remaining.match(/<\/(?:function_calls?|tool_calls?|tool_use[s]?|function|invoke|tool_name|parameters)>/);
+                if (tnIdx === -1 && tiIdx === -1 && piIdx === -1 && !closeMatch) {
                     // No opening tag found — but check if the tail looks like a partial tag
                     const partial = remaining.match(PARTIAL_TAG_RE);
                     if (partial) {
@@ -308,13 +425,13 @@ export function createToolCallFilter({ disableTools, forceStrip = false }) {
                     return output;
                 }
                 // Handle stray closing tags
-                if (closeMatch && tnIdx === -1 && tiIdx === -1) {
+                if (closeMatch && tnIdx === -1 && tiIdx === -1 && piIdx === -1) {
                     const cutIdx = closeMatch.index;
                     output += remaining.slice(0, cutIdx);
                     remaining = remaining.slice(cutIdx + closeMatch[0].length);
                     continue;
                 }
-                const cutIdx = tnIdx !== -1 ? (tiIdx !== -1 ? Math.min(tnIdx, tiIdx) : tnIdx) : tiIdx;
+                const cutIdx = tnIdx !== -1 ? (tiIdx !== -1 ? Math.min(tnIdx, tiIdx) : (piIdx !== -1 ? Math.min(tnIdx, piIdx) : tnIdx)) : (tiIdx !== -1 ? (piIdx !== -1 ? Math.min(tiIdx, piIdx) : tiIdx) : piIdx);
                 output += remaining.slice(0, cutIdx);
                 remaining = remaining.slice(cutIdx);
                 inBlock = true;
