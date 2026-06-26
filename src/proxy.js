@@ -821,6 +821,21 @@ export function createApp(config) {
                         let parsedToolCalls = hasExternalTools
                             ? parseExternalToolCallsFromText(externalToolRegistry, rawReasoning, rawContent)
                             : [];
+
+                        if (hasExternalTools) {
+                            logDebug(config, '=== RAW MODEL OUTPUT (streaming) ===');
+                            logDebug(config, 'rawContent (' + rawContent.length + ' chars):', rawContent.slice(0, 3000));
+                            logDebug(config, 'rawReasoning (' + rawReasoning.length + ' chars):', rawReasoning.slice(0, 3000));
+                            logDebug(config, 'parsedToolCalls count:', parsedToolCalls.length);
+                            if (parsedToolCalls.length > 0) {
+                                logDebug(config, 'parsedToolCalls:', JSON.stringify(parsedToolCalls, null, 2));
+                            }
+                            const { validCalls, invalidCalls } = validateToolCalls(parsedToolCalls, externalToolRegistry);
+                            if (invalidCalls.length > 0) {
+                                logDebug(config, 'INVALID tool calls:', JSON.stringify(invalidCalls, null, 2));
+                            }
+                        }
+
                         const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry, config);
 
                         if (validatedStreamedToolCalls.length > 0) {
@@ -841,6 +856,14 @@ export function createApp(config) {
                         const promptTokens = Math.ceil((fullPromptText || '').length / 4);
                         const totalTokens = promptTokens + completionTokens + reasoningTokens;
                         const finishReason = validatedStreamedToolCalls.length > 0 ? 'tool_calls' : 'stop';
+                        logDebug(config, 'Final response', {
+                            finishReason,
+                            validToolCalls: validatedStreamedToolCalls.length,
+                            rawContentLen: rawContent.length,
+                            rawReasoningLen: rawReasoning.length,
+                            contentBufferLen: contentBuffer.length,
+                            contentFlushed
+                        });
                         res.write(sseChunk(id, modelStr, {}, finishReason));
                         res.write(sseUsageChunk(id, modelStr, finishReason, {
                             prompt_tokens: promptTokens,
@@ -869,6 +892,21 @@ export function createApp(config) {
                         const parsedToolCalls = hasExternalTools
                             ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
                             : [];
+
+                        if (hasExternalTools) {
+                            logDebug(config, '=== RAW MODEL OUTPUT (non-streaming) ===');
+                            logDebug(config, 'content (' + (content || '').length + ' chars):', (content || '').slice(0, 3000));
+                            logDebug(config, 'reasoning (' + (reasoning || '').length + ' chars):', (reasoning || '').slice(0, 3000));
+                            logDebug(config, 'parsedToolCalls count:', parsedToolCalls.length);
+                            if (parsedToolCalls.length > 0) {
+                                logDebug(config, 'parsedToolCalls:', JSON.stringify(parsedToolCalls, null, 2));
+                            }
+                            const { validCalls: vCalls, invalidCalls: iCalls } = validateToolCalls(parsedToolCalls, externalToolRegistry);
+                            if (iCalls.length > 0) {
+                                logDebug(config, 'INVALID tool calls:', JSON.stringify(iCalls, null, 2));
+                            }
+                        }
+
                         const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry, config);
 
                         const safeContent = stripFunctionCallMarkup(content);

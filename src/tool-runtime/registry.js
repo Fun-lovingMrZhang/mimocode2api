@@ -88,9 +88,79 @@ export function buildExternalToolRegistry(tools, options = {}) {
   return registry;
 }
 
+// Common alias mapping — models may use their own built-in tool names
+// (Bash, bash, Grep, etc.) instead of the external tool names provided
+// in the system prompt. Map these to the registered external tools.
+const TOOL_NAME_ALIASES = {
+  // terminal/shell
+  'bash': 'terminal', 'shell': 'terminal', 'sh': 'terminal', 'cmd': 'terminal',
+  'execute_bash': 'terminal', 'run_command': 'terminal', 'command': 'terminal',
+  // file operations
+  'cat': 'read_file', 'read': 'read_file', 'view': 'read_file', 'open_file': 'read_file',
+  'grep': 'search_files', 'rg': 'search_files', 'find': 'search_files', 'glob': 'search_files',
+  'ls': 'search_files', 'list': 'search_files', 'list_files': 'search_files',
+  'write': 'write_file', 'create_file': 'write_file', 'edit': 'patch', 'sed': 'patch',
+  // web
+  'web_search': 'web_search', 'search': 'web_search', 'web_fetch': 'web_extract',
+  'fetch': 'web_extract', 'curl': 'terminal',
+};
+
 export function findExternalToolByName(registry, name) {
   if (!name || !Array.isArray(registry)) return null;
-  return registry.find((tool) => tool.namespacedName === name || tool.originalName === name) || null;
+  const normalized = name.trim();
+  // 1. Exact match (namespaced or original)
+  let tool = registry.find((t) => t.namespacedName === normalized || t.originalName === normalized) || null;
+  if (tool) return tool;
+  // 2. Strip external__ prefix and try again
+  const stripped = normalized.replace(/^external__/, '');
+  if (stripped !== normalized) {
+    tool = registry.find((t) => t.originalName === stripped) || null;
+    if (tool) return tool;
+  }
+  // 3. Case-insensitive match
+  const lower = normalized.toLowerCase();
+  tool = registry.find((t) => t.originalName.toLowerCase() === lower || t.namespacedName.toLowerCase() === lower) || null;
+  if (tool) return tool;
+  // 4. Alias lookup
+  const aliased = TOOL_NAME_ALIASES[lower];
+  if (aliased) {
+    tool = registry.find((t) => t.originalName === aliased || t.originalName.toLowerCase() === aliased.toLowerCase()) || null;
+    if (tool) return tool;
+  }
+  return null;
+}
+
+/**
+ * Find a tool by matching its parameter names against a set of known param names.
+ * Used when the model outputs <tool_input> format which has no tool name,
+ * only parameter tags like <command>, <path>, etc.
+ *
+ * Strategy: score each tool by how many of the given paramNames appear in its
+ * schema properties. Return the tool with the highest score (must be > 0).
+ */
+export function findToolByParamNames(registry, paramNames = []) {
+  if (!Array.isArray(registry) || registry.length === 0 || !Array.isArray(paramNames) || paramNames.length === 0) return null;
+  let bestTool = null;
+  let bestScore = 0;
+  for (const tool of registry) {
+    const props = tool?.parameters?.properties;
+    if (!props || typeof props !== 'object') continue;
+    const toolParams = Object.keys(props).map(k => k.toLowerCase());
+    let score = 0;
+    for (const pn of paramNames) {
+      const lower = pn.toLowerCase();
+      // Exact param name match = 2 points, partial match = 1 point
+      if (toolParams.includes(lower)) score += 2;
+      else if (toolParams.some(tp => tp.includes(lower) || lower.includes(tp))) score += 1;
+    }
+    // Bonus: if ALL param names match, strongly prefer this tool
+    if (score >= paramNames.length * 2 && paramNames.length > 0) score += 5;
+    if (score > bestScore) {
+      bestScore = score;
+      bestTool = tool;
+    }
+  }
+  return bestScore > 0 ? bestTool : null;
 }
 
 export function createRegistryIndex(registry) {

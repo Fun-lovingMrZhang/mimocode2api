@@ -1,15 +1,18 @@
-import { findExternalToolByName } from './registry.js';
+import { findExternalToolByName, findToolByParamNames } from './registry.js';
 
 // ─── Flexible tag matching ───
 // Models may output <function_calls>, <function_call>, <tool_call>, <tool_use>, etc.
 // Also <function=name> and <parameter=name> (self-closing XML style).
-const OPEN_TAG_RE = /<function_calls?>|<tool_calls?>|<tool_use[s]?>|<function(?:\s[^>]*)?>|<function_call\s+name=|<invoke\s+name=|<tool_name>/;
-const CLOSE_TAG_RE = /<\/function_calls?>|<\/tool_calls?>|<\/tool_use[s]?>|<\/function>|<\/invoke>|<\/tool_name>|<\/parameters>|\/>/;
+const OPEN_TAG_RE = /<function_calls?>|<tool_calls?>|<tool_use[s]?>|<function(?:\s[^>]*)?>|<function_call\s+name=|<invoke\s+name=|<tool_name>|<tool_input>|<function_name>/;
+const CLOSE_TAG_RE = /<\/function_calls?>|<\/tool_calls?>|<\/tool_use[s]?>|<\/function>|<\/invoke>|<\/tool_name>|<\/parameters>|<\/tool_input>|<\/function_name>|\/>/;
 // Some models use <tool_name>...</tool_name><tool_arguments>...</tool_arguments>
+// Others use <function_name>...</function_name><parameters>...</parameters>
 const TOOL_NAME_RE = /<tool_name>\s*([\s\S]*?)\s*<\/tool_name>/g;
 const TOOL_ARGS_RE = /<tool_arguments>\s*([\s\S]*?)\s*<\/tool_arguments>/g;
 // Some models use <invoke name="..."> or <call name="...">
 const INVOKE_RE = /<invoke\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\/invoke>/g;
+// <function_name> variant (same structure as <tool_name>)
+const FUNC_NAME_RE = /<function_name>\s*([\s\S]*?)\s*<\/function_name>/g;
 
 // Non-global versions for single-match use inside extractCallsFromBlock
 const TOOL_NAME_SINGLE = /<tool_name>\s*([\s\S]*?)\s*<\/tool_name>/;
@@ -53,9 +56,17 @@ export function stripFunctionCallMarkup(text, trim = true) {
     // Remove tool_name/tool_arguments pairs
     cleaned = cleaned.replace(/<tool_name>[\s\S]*?<\/tool_name>/g, '');
     cleaned = cleaned.replace(/<tool_arguments>[\s\S]*?<\/tool_arguments>/g, '');
+    // Remove <function_name>...</function_name> (variant of <tool_name>)
+    cleaned = cleaned.replace(/<function_name>[\s\S]*?<\/function_name>/g, '');
+    // Remove <tool_input>...</tool_input> blocks (model variant with no tool name)
+    cleaned = cleaned.replace(/<tool_input>[\s\S]*?<\/tool_input>/g, '');
+    cleaned = cleaned.replace(/<\/?tool_input>/g, '');
     // Remove <parameter=name>...</parameter> leftovers
     cleaned = cleaned.replace(/<parameter\s*=\s*[^>]+>[\s\S]*?<\/parameter>/g, '');
     cleaned = cleaned.replace(/<\/?parameter\s*=\s*[^>]*>/g, '');
+    // Remove <param name="...">value</param> leftovers
+    cleaned = cleaned.replace(/<param(?:eter)?\s+name\s*=\s*["'][^"']+["']\s*>[\s\S]*?<\/param(?:eter)?>/g, '');
+    cleaned = cleaned.replace(/<\/?param(?:eter)?\s+name\s*=\s*["'][^"']*["']\s*>/g, '');
     // Remove <arg name="...">...</arg> leftovers
     cleaned = cleaned.replace(/<arg\s+name=[^>]+>[\s\S]*?<\/arg>/g, '');
     cleaned = cleaned.replace(/<\/?arg\s+name=[^>]*>/g, '');
@@ -133,17 +144,18 @@ function extractCallsFromBlock(content) {
                 try {
                     args = JSON.stringify(JSON.parse(rawArgs));
                 } catch {
-                    // Not JSON — try XML tag format: <param_name>value</param_name>
-                    const xmlArgMatches = [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)];
-                    if (xmlArgMatches.length > 0) {
-                        const argObj = {};
-                        xmlArgMatches.forEach((am) => {
-                            argObj[am[1]] = am[2].trim();
-                        });
-                        args = JSON.stringify(argObj);
-                    } else {
-                        args = rawArgs;
-                    }
+                    // Not JSON — try XML tag formats
+                    const argObj = {};
+                    [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    [...rawArgs.matchAll(/<arg\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/arg>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    args = Object.keys(argObj).length > 0 ? JSON.stringify(argObj) : rawArgs;
                 }
             }
             calls.push({ name, arguments: args });
@@ -216,17 +228,57 @@ export function parseToolCallsFromText(...chunks) {
                 try {
                     args = JSON.stringify(JSON.parse(rawArgs));
                 } catch {
-                    // Not JSON — try XML tag format: <param_name>value</param_name>
-                    const xmlArgMatches = [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)];
-                    if (xmlArgMatches.length > 0) {
-                        const argObj = {};
-                        xmlArgMatches.forEach((am) => {
-                            argObj[am[1]] = am[2].trim();
-                        });
-                        args = JSON.stringify(argObj);
-                    } else {
-                        args = rawArgs;
-                    }
+                    // Not JSON — try XML tag formats
+                    const argObj = {};
+                    // Format 1: <param_name>value</param_name>
+                    [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    // Format 2: <param name="key">value</param> or <parameter name="key">value</parameter>
+                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    // Format 3: <arg name="key">value</arg>
+                    [...rawArgs.matchAll(/<arg\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/arg>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    args = Object.keys(argObj).length > 0 ? JSON.stringify(argObj) : rawArgs;
+                }
+            }
+            matches.push({
+                id: `call_${Date.now()}_${matches.length + index + 1}`,
+                type: 'function',
+                function: { name, arguments: args }
+            });
+        });
+
+        // Pattern 2b: <function_name>...</function_name><parameters>...</parameters>
+        // (variant of Pattern 2 — some models use function_name instead of tool_name)
+        const funcNameMatches = [...chunk.matchAll(FUNC_NAME_RE)];
+        funcNameMatches.forEach((nm, index) => {
+            const name = nm[1].trim();
+            // Find corresponding arguments: try <tool_arguments> first, then <parameters>
+            const afterName = chunk.slice(nm.index + nm[0].length);
+            let argsMatch = afterName.match(TOOL_ARGS_SINGLE);
+            if (!argsMatch) argsMatch = afterName.match(PARAMETERS_SINGLE);
+            let args = '{}';
+            if (argsMatch) {
+                const rawArgs = argsMatch[1].trim();
+                try {
+                    args = JSON.stringify(JSON.parse(rawArgs));
+                } catch {
+                    // Not JSON — try XML tag formats
+                    const argObj = {};
+                    [...rawArgs.matchAll(/<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    [...rawArgs.matchAll(/<param(?:eter)?\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/param(?:eter)?>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    [...rawArgs.matchAll(/<arg\s+name\s*=\s*["']([^"']+)["']\s*>\s*([\s\S]*?)\s*<\/arg>/g)].forEach((am) => {
+                        argObj[am[1]] = am[2].trim();
+                    });
+                    args = Object.keys(argObj).length > 0 ? JSON.stringify(argObj) : rawArgs;
                 }
             }
             matches.push({
@@ -349,6 +401,40 @@ export function parseToolCallsFromText(...chunks) {
                 });
             }
         }
+
+        // Pattern 7: <tool_input> format — no tool name, only parameter tags.
+        // Model outputs e.g. <tool_input><command>ls -la</command></tool_input>
+        // We extract parameter names+values, then use findToolByParamNames to
+        // identify the tool by matching parameter names against the registry.
+        // This pattern runs even if other patterns matched, because the model
+        // may mix formats across different tool calls in the same response.
+        {
+            const toolInputRegex = /<tool_input>([\s\S]*?)<\/tool_input>/g;
+            for (const tim of chunk.matchAll(toolInputRegex)) {
+                const body = tim[1];
+                const args = {};
+                const paramNames = [];
+                // Extract <param_name>value</param_name> style parameters
+                const paramRegex = /<([a-zA-Z_][a-zA-Z0-9_]*)>\s*([\s\S]*?)\s*<\/\1>/g;
+                for (const pm of body.matchAll(paramRegex)) {
+                    args[pm[1].trim()] = pm[2].trim();
+                    paramNames.push(pm[1].trim());
+                }
+                if (paramNames.length === 0) continue;
+                // Find the tool by parameter name matching — registry passed via
+                // parseExternalToolCallsFromText which calls this function.
+                // We set a placeholder name here; the registry lookup happens
+                // in parseExternalToolCallsFromText via findToolByParamNames.
+                matches.push({
+                    id: `call_${Date.now()}_${matches.length + 1}`,
+                    type: 'function',
+                    function: {
+                        name: `__param_inferred__${paramNames.join(',')}`,
+                        arguments: JSON.stringify(args)
+                    }
+                });
+            }
+        }
     });
     return matches;
 }
@@ -358,7 +444,25 @@ export function parseExternalToolCallsFromText(registry, ...chunks) {
     const rawCalls = parseToolCallsFromText(...chunks);
     const counts = new Map();
     return rawCalls.flatMap((rawCall) => {
-        const tool = findExternalToolByName(registry, rawCall?.function?.name);
+        const rawName = rawCall?.function?.name;
+        // Handle <tool_input> format: name is __param_inferred__param1,param2,...
+        if (rawName && rawName.startsWith('__param_inferred__')) {
+            const paramNames = rawName.replace('__param_inferred__', '').split(',');
+            const tool = findToolByParamNames(registry, paramNames);
+            if (!tool) return [];
+            const nextCount = (counts.get(tool.namespacedName) || 0) + 1;
+            counts.set(tool.namespacedName, nextCount);
+            return [{
+                id: rawCall.id || `call_${tool.namespacedName.replace(/[^a-zA-Z0-9_]/g, '_')}_${nextCount}`,
+                type: 'function',
+                function: {
+                    name: tool.originalName,
+                    arguments: rawCall.function.arguments
+                }
+            }];
+        }
+        // Normal name-based lookup
+        const tool = findExternalToolByName(registry, rawName);
         if (!tool) return [];
         const nextCount = (counts.get(tool.namespacedName) || 0) + 1;
         counts.set(tool.namespacedName, nextCount);
@@ -377,7 +481,7 @@ export function parseExternalToolCallsFromText(registry, ...chunks) {
 // Stateful filter that handles tool-call XML tags split across stream deltas.
 // When a partial opening tag is detected at the end of a chunk (e.g. "<func"),
 // it is held back until the next chunk completes or refutes the tag.
-const PARTIAL_TAG_RE = /<\/?(?:func|tool|invoke|parameter|arg|function|tool_use|parameters)?[a-z_=]*$/i;
+const PARTIAL_TAG_RE = /<\/?(?:func|tool|invoke|parameter|arg|function|tool_use|parameters|tool_input|function_name)?[a-z_=]*$/i;
 
 export function createToolCallFilter({ disableTools, forceStrip = false }) {
     if (!disableTools && !forceStrip) return (chunk) => chunk;
@@ -410,9 +514,11 @@ export function createToolCallFilter({ disableTools, forceStrip = false }) {
                 const tnIdx = remaining.indexOf('<tool_name>');
                 const tiIdx = remaining.indexOf('<tool_arguments>');
                 const piIdx = remaining.indexOf('<parameters>');
+                const tinIdx = remaining.indexOf('<tool_input>');
+                const fnIdx = remaining.indexOf('<function_name>');
                 // Also check for stray closing tags (model output bug)
-                const closeMatch = remaining.match(/<\/(?:function_calls?|tool_calls?|tool_use[s]?|function|invoke|tool_name|parameters)>/);
-                if (tnIdx === -1 && tiIdx === -1 && piIdx === -1 && !closeMatch) {
+                const closeMatch = remaining.match(/<\/(?:function_calls?|tool_calls?|tool_use[s]?|function|invoke|tool_name|parameters|tool_input|function_name)>/);
+                if (tnIdx === -1 && tiIdx === -1 && piIdx === -1 && tinIdx === -1 && fnIdx === -1 && !closeMatch) {
                     // No opening tag found — but check if the tail looks like a partial tag
                     const partial = remaining.match(PARTIAL_TAG_RE);
                     if (partial) {
@@ -425,13 +531,14 @@ export function createToolCallFilter({ disableTools, forceStrip = false }) {
                     return output;
                 }
                 // Handle stray closing tags
-                if (closeMatch && tnIdx === -1 && tiIdx === -1 && piIdx === -1) {
+                if (closeMatch && tnIdx === -1 && tiIdx === -1 && piIdx === -1 && tinIdx === -1 && fnIdx === -1) {
                     const cutIdx = closeMatch.index;
                     output += remaining.slice(0, cutIdx);
                     remaining = remaining.slice(cutIdx + closeMatch[0].length);
                     continue;
                 }
-                const cutIdx = tnIdx !== -1 ? (tiIdx !== -1 ? Math.min(tnIdx, tiIdx) : (piIdx !== -1 ? Math.min(tnIdx, piIdx) : tnIdx)) : (tiIdx !== -1 ? (piIdx !== -1 ? Math.min(tiIdx, piIdx) : tiIdx) : piIdx);
+                const indices = [tnIdx, tiIdx, piIdx, tinIdx, fnIdx].filter(i => i !== -1);
+                const cutIdx = Math.min(...indices);
                 output += remaining.slice(0, cutIdx);
                 remaining = remaining.slice(cutIdx);
                 inBlock = true;
@@ -468,27 +575,40 @@ export function createExternalToolCallStreamParser(registry) {
         while (buffer.length) {
             // Try to find any opening tag
             const open = matchOpenTag(buffer);
-            // Also check bare tool_name format
+            // Also check bare tool_name format, tool_input format, and function_name format
             const bareNameIdx = buffer.indexOf('<tool_name>');
+            const bareInputIdx = buffer.indexOf('<tool_input>');
+            const bareFuncNameIdx = buffer.indexOf('<function_name>');
 
-            if (!open && bareNameIdx === -1) {
+            if (!open && bareNameIdx === -1 && bareInputIdx === -1 && bareFuncNameIdx === -1) {
                 // No opening tag found — keep tail for partial match
                 buffer = buffer.slice(-minTagLen);
                 break;
             }
 
-            const startIdx = open ? open.index : bareNameIdx;
-            const openLen = open ? open.length : '<tool_name>'.length;
+            const startIdx = open ? open.index : Math.min(...[bareNameIdx, bareInputIdx, bareFuncNameIdx].filter(i => i !== -1));
+            const openLen = open ? open.length : (startIdx === bareNameIdx ? '<tool_name>'.length : (startIdx === bareInputIdx ? '<tool_input>'.length : '<function_name>'.length));
 
             // Find closing tag
             let close = null;
             if (open) {
                 close = matchCloseTag(buffer, startIdx + openLen);
             } else {
-                // For bare format, find </tool_arguments>
+                // For bare format, find </tool_arguments>, </tool_input>, or </function_name>
                 const argsClose = buffer.indexOf('</tool_arguments>', startIdx + openLen);
-                if (argsClose !== -1) {
-                    close = { index: argsClose, length: '</tool_arguments>'.length };
+                const inputClose = buffer.indexOf('</tool_input>', startIdx + openLen);
+                const funcNameClose = buffer.indexOf('</function_name>', startIdx + openLen);
+                // Find the closest closing tag
+                const closeIndices = [argsClose, inputClose, funcNameClose].filter(i => i !== -1);
+                if (closeIndices.length > 0) {
+                    const minClose = Math.min(...closeIndices);
+                    if (minClose === inputClose) {
+                        close = { index: inputClose, length: '</tool_input>'.length };
+                    } else if (minClose === argsClose) {
+                        close = { index: argsClose, length: '</tool_arguments>'.length };
+                    } else {
+                        close = { index: funcNameClose, length: '</function_name>'.length };
+                    }
                 }
             }
 
