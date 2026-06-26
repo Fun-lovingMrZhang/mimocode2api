@@ -104,7 +104,8 @@ const TOOL_NAME_ALIASES = {
   'web_search': 'web_search', 'search': 'web_search', 'web_fetch': 'web_extract',
   'fetch': 'web_extract', 'curl': 'terminal', 'webfetch': 'web_extract', 'websearch': 'web_search',
   // misc — case-insensitive variants
-  'Read': 'read_file',
+  'Read': 'read_file', 'TodoWrite': 'todo', 'TodoRead': 'todo', 'TodoUpdate': 'todo', 'Todo': 'todo',
+  'TodoDelete': 'todo', 'TodoList': 'todo',
 };
 
 export function findExternalToolByName(registry, name) {

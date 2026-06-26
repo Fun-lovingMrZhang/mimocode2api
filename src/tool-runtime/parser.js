@@ -394,8 +394,9 @@ export function parseToolCallsFromText(...chunks) {
         // Pattern 4: Bare JSON (no XML tags) — {"name":"external__tool","arguments":{...}}
         // Only try if no XML-tagged calls were found
         if (matches.length === 0) {
-            // Find all JSON objects that look like tool calls
-            const jsonRegex = /\{[^{}]*"name"\s*:\s*"[^"]+"[^{}]*"arguments"\s*:\s*\{[^{}]*\}[^{}]*\}/g;
+            // Find all JSON objects that look like tool calls.
+            // arguments can be a JSON object OR a JSON string (model may serialize it)
+            const jsonRegex = /\{[^{}]*"name"\s*:\s*"[^"]+"[^{}]*"arguments"\s*:\s*(?:\{[^{}]*\}|"[^"]*")[^{}]*\}/g;
             const jsonMatches = [...chunk.matchAll(jsonRegex)];
             for (const jm of jsonMatches) {
                 try {
@@ -410,6 +411,29 @@ export function parseToolCallsFromText(...chunks) {
                         });
                     }
                 } catch {}
+            }
+            // Also try bare JSON arrays: [{"id":"x","name":"...","arguments":"..."}]
+            if (matches.length === 0) {
+                const arrRegex = /\[\s*\{[\s\S]*?"name"\s*:\s*"[^"]+"[\s\S]*?"arguments"[\s\S]*?\}\s*\]/g;
+                const arrMatches = [...chunk.matchAll(arrRegex)];
+                for (const am of arrMatches) {
+                    try {
+                        const parsed = JSON.parse(am[0]);
+                        if (Array.isArray(parsed)) {
+                            parsed.forEach((item) => {
+                                const name = item?.name || item?.function?.name;
+                                const args = item?.arguments ?? item?.function?.arguments ?? {};
+                                if (name) {
+                                    matches.push({
+                                        id: item?.id || `call_${Date.now()}_${matches.length + 1}`,
+                                        type: 'function',
+                                        function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) }
+                                    });
+                                }
+                            });
+                        }
+                    } catch {}
+                }
             }
         }
 
@@ -485,6 +509,36 @@ export function parseToolCallsFromText(...chunks) {
             }
         }
     });
+    // Deduplicate: when the same tool name appears multiple times due to
+    // overlapping pattern matches, keep only the one with non-empty arguments.
+    // Models trigger this when <tool_name> is followed by bare <param> tags —
+    // Pattern 2 matches it, and Pattern 7 (<tool_input>) also matches the
+    // <param> tags inside, producing a duplicate with empty args {}.
+    if (matches.length > 1) {
+        const byName = new Map();
+        const deduped = [];
+        for (const m of matches) {
+            const name = m.function?.name || '';
+            const args = m.function?.arguments || '{}';
+            const isEmpty = args === '{}' || args === '';
+            if (!byName.has(name)) {
+                byName.set(name, { call: m, isEmpty });
+                deduped.push(m);
+            } else {
+                const existing = byName.get(name);
+                if (existing.isEmpty && !isEmpty) {
+                    // Replace empty-args call with non-empty one
+                    const idx = deduped.indexOf(existing.call);
+                    if (idx !== -1) deduped[idx] = m;
+                    existing.call = m;
+                    existing.isEmpty = false;
+                }
+                // If existing is non-empty, keep it (drop the duplicate)
+            }
+        }
+        matches.length = 0;
+        matches.push(...deduped);
+    }
     return matches;
 }
 
