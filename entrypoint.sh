@@ -2,7 +2,7 @@
 
 PUID=${PUID:-1000}
 PGID=${PGID:-1000}
-MIMOCODE_SERVER_PASSWORD=${MIMO...nssl rand -hex 16)}
+MIMOCODE_SERVER_PASSWORD=${MIMOCODE_SERVER_PASSWORD:-$(openssl rand -hex 16)}
 
 if [ "$(id -g node)" -ne "$PGID" ]; then
     groupmod -o -g "$PGID" node
